@@ -1,0 +1,26 @@
+# systemd service for the panel. Edit User/Group and the paths, then:
+#   sudo cp deploy/wow-panel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now wow-panel
+# Output and errors:  journalctl -u wow-panel -f
+#
+# Run it as the same user that runs mangosd/realmd: the panel edits mangosd.conf, reads the core's
+# logs and may restart realmd (PANEL_KILLABLE) — all of that needs the same owner.
+
+[Unit]
+Description=WoW Web Panel (CMaNGOS Classic)
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wow
+Group=wow
+WorkingDirectory=/opt/wow-panel
+ExecStart=/opt/wow-panel/venv/bin/python -u panel.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

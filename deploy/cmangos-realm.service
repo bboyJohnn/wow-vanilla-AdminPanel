@@ -1,0 +1,21 @@
+# OPTIONAL: run the login server (realmd) under systemd. With Restart=always the panel can restart
+# it from the Services table — add  PANEL_KILLABLE=realmd  to .env. Edit User/Group and the paths, then:
+#   sudo cp deploy/cmangos-realm.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cmangos-realm
+
+[Unit]
+Description=CMaNGOS Classic login server (realmd)
+After=network-online.target mariadb.service mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wow
+Group=wow
+WorkingDirectory=/home/wow/cmangos/run/bin
+ExecStart=/home/wow/cmangos/run/bin/realmd -c /home/wow/cmangos/run/etc/realmd.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
