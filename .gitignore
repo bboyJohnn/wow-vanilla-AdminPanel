@@ -1,0 +1,15 @@
+# your settings and the panel's own data (history, audit log, copies of custom content)
+.env
+data/
+
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Blizzard files: built from your own game client by tools/build_assets.py or added by hand (see README)
+static/fonts/
+static/music/
+static/wow/maps/*.webp
+static/wow/renders/
+static/wow/bg-*.jpg

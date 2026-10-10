@@ -114,7 +114,7 @@ python3 --version
 ### Step 3. Download the panel and install its packages
 
 ```bash
-sudo git clone https://github.com/<your-account>/wow-web-panel.git /opt/wow-panel
+sudo git clone https://github.com/bboyJohnn/wow-vanilla-AdminPanel.git /opt/wow-panel
 ```
 
 ```bash
@@ -348,7 +348,7 @@ no music, and the **World map** page shows no pictures (typing coordinates still
 your own **1.12.1 client**. Do it on the computer where the game is installed — for example a Windows PC:
 
 1. Install Python 3 from [python.org](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
-2. Download this repository as ZIP from GitHub and unpack it, e.g. to `C:\wow-web-panel`.
+2. Download this repository as ZIP from GitHub (**Code → Download ZIP**) and unpack it, e.g. to `C:\wow-vanilla-AdminPanel`.
 3. In PowerShell:
 
 ```powershell
@@ -356,7 +356,7 @@ py -m pip install pillow
 ```
 
 ```powershell
-cd C:\wow-web-panel
+cd C:\wow-vanilla-AdminPanel
 ```
 
 ```powershell
