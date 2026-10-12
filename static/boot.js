@@ -7,7 +7,7 @@
    Русский — язык исходного текста, словарь ему не нужен; для остальных подключается
    static/i18n/<код>.js — обычным <script> через document.write, чтобы он успел до app.js. */
 (function () {
-  var V = '1';    // версия файлов — та же, что ?v= в index.html
+  var V = '2';    // версия файлов — та же, что ?v= в index.html
   var LANGS = [
     ['ru', 'Русский', 'ru-RU'], ['en', 'English', 'en-GB'], ['de', 'Deutsch', 'de-DE'],
     ['fr', 'Français', 'fr-FR'], ['es', 'Español', 'es-ES'], ['pt', 'Português', 'pt-BR'],

@@ -11,6 +11,7 @@ What it writes (all optional — the panel works without them, it only looks pla
     static/fonts/frizqt.ttf, morpheus.ttf  — Friz Quadrata (whole interface) and Morpheus (headings)
     static/music/*.mp3                     — 13 tracks: main theme, capitals, zones, taverns
     static/wow/maps/*.webp                 — 49 world/continent/zone maps for the map teleport (needs Pillow)
+    static/wow/minimap/                    — top-down view tiles from the client minimaps (needs Pillow)
 
 Needs Python 3.8+. Maps also need Pillow: pip install pillow.
 Backgrounds and race/class pictures (static/wow/bg-*.jpg, static/wow/renders/) come from Blizzard's
@@ -114,7 +115,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     if not args or not os.path.isdir(os.path.join(args[0], 'Data')):
         sys.exit(__doc__ + '\nGive the folder of the game client (the one with Data\\ inside).')
-    only = {'fonts', 'music', 'maps'}
+    only = {'fonts', 'music', 'maps', 'minimap'}
     for a in sys.argv[1:]:
         if a.startswith('--only='):
             only = set(a.split('=', 1)[1].split(','))
@@ -131,15 +132,20 @@ def main():
     if 'music' in only:
         print('Music:')
         build_music(wd)
-    if 'maps' in only:
-        print('World maps:')
+    if only & {'maps', 'minimap'}:
         try:
             import PIL  # noqa: F401
         except ImportError:
             sys.exit('  Pillow is needed for the maps: pip install pillow')
+    if 'maps' in only:
+        print('World maps:')
         import build_maps
         build_maps.build(client, images=True, write_json='--json' in sys.argv)
-    print('Done. Copy static/fonts, static/music and static/wow/maps to the panel on the server.')
+    if 'minimap' in only:
+        print('Top-down view (minimap tiles):')
+        import build_minimap
+        build_minimap.build(client)
+    print('Done. Copy static/fonts, static/music, static/wow/maps and static/wow/minimap to the panel on the server.')
 
 
 if __name__ == '__main__':

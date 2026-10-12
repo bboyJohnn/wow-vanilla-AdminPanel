@@ -134,6 +134,7 @@ const ICONS = {
   worldmap: 'M9 4L3 6v14l6-2 6 2 6-2V4l-6 2z|M9 4v14|M15 6v14',
   npcs: 'M12 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z|M5 21v-1a7 7 0 0 1 14 0v1|M17 3l1.5 1.5L21 2',
   quests: 'M12 3v11|M12 18v.01|M7 21h10|M5 3h14',
+  events: 'M4 6h16v14H4z|M4 10h16|M8 3v5|M16 3v5|M8 14h.01|M12 14h.01|M16 14h.01|M8 17h.01|M12 17h.01',
   globe: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z|M3 12h18|M12 3a14 14 0 0 1 0 18|M12 3a14 14 0 0 0 0 18',
   palette: 'M12 3a9 9 0 1 0 0 18c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.4c2.5 0 4.6-2 4.6-4.6C22 6.1 17.5 3 12 3z|M7.5 11.5h.01|M10.5 7.5h.01|M15.5 7.5h.01',
 };
@@ -465,13 +466,15 @@ function toast(text, bad = false) {
 
 const overlays = [];
 
-function openOverlay(content) {
+function openOverlay(content, onClosed) {
   const ov = h('div', { class: 'overlay' }, content);
   const close = () => {
+    if (!ov.isConnected) return;
     ov.remove();
     itipHide();
     const i = overlays.indexOf(close);
     if (i >= 0) overlays.splice(i, 1);
+    if (onClosed) onClosed();
   };
   ov.addEventListener('mousedown', (e) => { if (e.target === ov) close(); });
   document.body.append(ov);
@@ -640,6 +643,69 @@ function card(title, hint, actions, ...body) {
       h('h3', null, title, hint ? h('span', { class: 'hint' }, '  ' + hint) : null),
       actions ? h('div', { class: 'row' }, actions) : null) : null,
     ...body);
+}
+
+/* Карточку сворачивает щелчок по заголовку; что свёрнуто — помнит браузер (по ключу key) */
+function foldCard(el, key) {
+  const head = el && el.querySelector(':scope > .card-h');
+  if (!head) return el;
+  const folded = () => new Set(pref.get('fold', '').split(',').filter(Boolean));
+  el.classList.add('foldable');
+  el.classList.toggle('folded', folded().has(key));
+  head.title = L('Свернуть или развернуть');
+  head.addEventListener('click', (e) => {
+    if (e.target.closest('button, a, input, select, label')) return;
+    const f = folded();
+    if (el.classList.toggle('folded')) f.add(key); else f.delete(key);
+    pref.set('fold', [...f].join(','));
+  });
+  return el;
+}
+
+/* Выбор месяца: щелчок по «Октябрь 2026» — окошко с годом ‹ › и двенадцатью месяцами
+   (yearsOnly — только годы). marks(y, m) — подсветить месяцы, где что-то есть. onPick(y, m). */
+function monthPicker(anchor, { year, month, yearsOnly, marks }, onPick) {
+  document.querySelectorAll('.mpick').forEach((p) => p.remove());
+  const now = new Date();
+  let y = year;
+  const pop = h('div', { class: 'mpick', role: 'dialog' });
+  const close = () => {
+    pop.remove();
+    document.removeEventListener('mousedown', outside, true);
+    document.removeEventListener('keydown', esc, true);
+    window.removeEventListener('scroll', onScroll, true);
+  };
+  const outside = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) close(); };
+  const esc = (e) => { if (e.key === 'Escape') { e.stopImmediatePropagation(); close(); } };
+  const onScroll = (e) => { if (!pop.contains(e.target)) close(); };
+  const arrow = (label, dy) => h('button', { class: 'btn sm', type: 'button', 'aria-label': label, onclick: () => { y += dy; draw(); } }, dy < 0 ? '‹' : '›');
+  const cell = (label, on, has, isNow, pick) => h('button', { type: 'button', class: [on ? 'on' : '', has ? 'has' : '', isNow ? 'now' : ''].join(' ').trim() || null,
+    onclick: () => { close(); pick(); } }, label);
+  const draw = () => {
+    if (yearsOnly) {
+      const y0 = y - 5;
+      fill(pop, h('div', { class: 'mpick-h' }, arrow(L('Раньше'), -12), h('b', null, `${y0} – ${y0 + 11}`), arrow(L('Позже'), 12)),
+        h('div', { class: 'mpick-g' }, [...Array(12)].map((_, i) => cell(String(y0 + i), y0 + i === year, false, y0 + i === now.getFullYear(), () => onPick(y0 + i, null)))));
+      return;
+    }
+    fill(pop, h('div', { class: 'mpick-h' }, arrow(L('Прошлый год'), -1), h('b', null, String(y)), arrow(L('Следующий год'), 1)),
+      h('div', { class: 'mpick-g' }, [...Array(12)].map((_, m) => cell(new Date(y, m, 1).toLocaleDateString(LOCALE, { month: 'short' }).replace('.', ''),
+        y === year && m === month, marks && marks(y, m), y === now.getFullYear() && m === now.getMonth(), () => onPick(y, m)))));
+  };
+  draw();
+  document.body.append(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.top = Math.round(r.bottom + 6) + 'px';
+  pop.style.left = Math.round(Math.max(8, Math.min(window.innerWidth - pop.offsetWidth - 8, r.left + r.width / 2 - pop.offsetWidth / 2))) + 'px';
+  setTimeout(() => {
+    document.addEventListener('mousedown', outside, true);
+    document.addEventListener('keydown', esc, true);
+    window.addEventListener('scroll', onScroll, true);
+  }, 0);
+}
+function monthButton(label, open, extra) {
+  return h('button', { class: 'mpick-btn' + (extra ? ' ' + extra : ''), type: 'button', title: L('Выбрать месяц и год'),
+    onclick: (e) => open(e.currentTarget) }, h('span', null, label), h('span', { class: 'mpick-caret' }, '▾'));
 }
 
 function tile(label, value, detail, extra) {
@@ -953,7 +1019,7 @@ function chartCard(title, hint, build, tableSpec) {
 const PAGES = {};
 const NAV = [
   ['overview', L('Обзор')], ['online', L('Онлайн')], ['accounts', L('Аккаунты')], ['characters', L('Персонажи')], ['worldmap', L('Карта мира')],
-  ['items', L('Предметы')], ['npcs', L('Свои НПС')], ['quests', L('Свои задания')],
+  ['items', L('Предметы')], ['npcs', L('Свои НПС')], ['quests', L('Свои задания')], ['events', L('События')],
   ['bans', L('Модерация')], ['stats', L('Статистика')], ['server', L('Сервер')], ['bots', L('Боты')], ['logs', L('Логи')],
   ['console', L('Консоль')], ['audit', L('Журнал')], ['settings', L('Настройки')],
 ];
@@ -1587,6 +1653,7 @@ function calendarBox(days, { fmt, summary, detail, empty }) {
   const last = keys.length ? keyDate(keys[keys.length - 1]) : new Date();
   let y = last.getFullYear(), m = last.getMonth();
   let picked = keys.length ? keys[keys.length - 1] : null;
+  const months = new Set(keys.map((k) => k.slice(0, 7)));
   const box = h('div', { class: 'cal-wrap' });
   const draw = () => {
     const first = new Date(y, m, 1), lead = (first.getDay() + 6) % 7, n = new Date(y, m + 1, 0).getDate();
@@ -1607,14 +1674,9 @@ function calendarBox(days, { fmt, summary, detail, empty }) {
     const go = (dm) => { m += dm; if (m < 0) { m = 11; y--; } if (m > 11) { m = 0; y++; } draw(); };
     const nav = h('div', { class: 'cal-nav' },
       h('button', { class: 'btn sm', type: 'button', 'aria-label': L('Предыдущий месяц'), onclick: () => go(-1) }, icon('prev'), L('Назад')),
-      h('b', null, `${MONTHS[m]} ${y}`),
-      h('button', { class: 'btn sm', type: 'button', 'aria-label': L('Следующий месяц'), onclick: () => go(1) }, L('Вперёд'), icon('next')),
-      keys.length ? h('select', { class: 'inp cal-jump', 'aria-label': L('Перейти к месяцу'), onchange: (e) => {
-        const [yy, mm] = e.target.value.split('-').map(Number); y = yy; m = mm - 1; draw(); } },
-        [...new Set(keys.map((k) => k.slice(0, 7)))].reverse().map((ym) => {
-          const [yy, mm] = ym.split('-').map(Number);
-          return h('option', { value: ym, selected: yy === y && mm === m + 1 }, `${MONTHS[mm - 1]} ${yy}`);
-        })) : null);
+      monthButton(`${MONTHS[m]} ${y}`, (el) => monthPicker(el, { year: y, month: m, marks: (yy, mm) => months.has(`${yy}-${pad2(mm + 1)}`) },
+        (yy, mm) => { y = yy; m = mm; draw(); })),
+      h('button', { class: 'btn sm', type: 'button', 'aria-label': L('Следующий месяц'), onclick: () => go(1) }, L('Вперёд'), icon('next')));
     const inMonth = picked && picked.startsWith(prefix) && days[picked];
     box.replaceChildren(
       h('div', { class: 'cal-top' }, h('div', { class: 'cal-left' }, nav, grid),
@@ -4525,37 +4587,244 @@ function zoneAt(m, mapid, x, y) {
 
 /* Просмотр карты с выбором точки. opts: { char — имя персонажа (его метка и стартовая зона),
    start — {map, x, y} открыть сразу эту точку, pickLabel и onPick(point) — кнопка под выбранной
-   точкой, extra(point) — свои узлы в карточке точки }. */
+   точкой, extra(point) — свои узлы в карточке точки, marks — свои метки [{map, x, y, cls, title}],
+   open — {map, zoneArea, x, y} открыть зону (или {map} — материк), readonly и note — только смотреть }.
+   Колёсико приближает к курсору, карту можно тянуть мышью или пальцем, два пальца — масштаб.
+   Уровни сменяются сами, как в игре: приблизили зону под курсором почти во весь экран — открывается
+   её карта, отдалили карту зоны до конца — снова материк, где эта зона во весь экран. Города
+   (Штормград в Элвиннском лесу) — уровень ниже своей зоны.
+   «Вид сверху» — как на wow.tools: материк из мини-карт игры, плитки 256×256 с пирамидой уровней
+   (tools/build_minimap.py), приблизить можно до отдельных деревьев. Карта зоны, приближенная до
+   конца, сама переходит в вид сверху. */
 function worldMapView(opts = {}) {
-  const st = { view: 'world', cont: null, zone: null, zoom: 1, point: null, pins: {}, char: opts.char || null };
+  const st = { view: 'world', cont: null, zone: null, point: null, pins: {}, char: opts.char || null,
+    mode: pref.get('wm-mode', 'art'), top: null, aspect: [1002, 668] };
+  // масштаб, сдвиг картинки в окне (px), её размер при масштабе 1 и какая её точка (доли) в центре окна
+  const tf = { s: 1, x: 0, y: 0, w: 0, h: 0, cx: 0.5, cy: 0.5 };
   const crumbs = h('div', { class: 'wm-crumbs' });
   const zoneSel = h('select', { class: 'inp', 'aria-label': L('Зона') });
   const img = h('img', { class: 'wm-img', alt: '', draggable: 'false' });
   const layer = h('div', { class: 'wm-layer' });
-  const canvas = h('div', { class: 'wm-canvas' }, img, layer);
-  const scroller = h('div', { class: 'wm-scroll' }, canvas);
+  const tilesEl = h('div', { class: 'wm-tiles' });
+  const canvas = h('div', { class: 'wm-canvas' }, img, tilesEl, layer);
+  const zin = h('button', { class: 'btn sm', type: 'button', title: L('Крупнее'), 'aria-label': L('Крупнее') }, '+');
+  const zout = h('button', { class: 'btn sm', type: 'button', title: L('Мельче'), 'aria-label': L('Мельче') }, '−');
+  const zfit = h('button', { class: 'btn sm', type: 'button', title: L('Вся карта'), 'aria-label': L('Вся карта') }, '⤢');
+  const view = h('div', { class: 'wm-view', tabindex: 0 }, canvas, h('div', { class: 'wm-zoom' }, zin, zout, zfit));
   const coords = h('span', { class: 'mono small muted wm-coords' });
   const info = h('div', { class: 'wm-info stack' });
+  const modeBox = h('span', { class: 'wm-mode' });
   let mark = null;
   let man = null;
+  let mini = null;
+  let lastSwitch = 0;
+  let anim = 0;
 
-  const setZoom = (z) => {
-    st.zoom = Math.max(1, Math.min(4, z));
-    canvas.style.width = (st.zoom * 100) + '%';
+  // ---- масштаб и сдвиг: картинка лежит в окне целиком при масштабе 1, дальше её размер растёт
+  const vw = () => view.clientWidth;
+  const vh = () => view.clientHeight;
+  const fitBase = () => {
+    const [iw, ih] = st.aspect;
+    const k = Math.min(vw() / iw, vh() / ih);
+    if (k > 0) { tf.w = iw * k; tf.h = ih * k; }
   };
-  const zoomBtns = h('div', { class: 'row' },
-    h('button', { class: 'btn sm', type: 'button', title: L('Мельче'), onclick: () => setZoom(st.zoom / 1.5) }, '−'),
-    h('button', { class: 'btn sm', type: 'button', title: L('Крупнее'), onclick: () => setZoom(st.zoom * 1.5) }, '+'));
+  function applyTf() {
+    if (!tf.w) fitBase();
+    const cw = tf.w * tf.s, ch = tf.h * tf.s, W = vw(), H = vh();
+    tf.x = cw <= W ? (W - cw) / 2 : Math.min(0, Math.max(W - cw, tf.x));
+    tf.y = ch <= H ? (H - ch) / 2 : Math.min(0, Math.max(H - ch, tf.y));
+    canvas.style.left = tf.x + 'px';
+    canvas.style.top = tf.y + 'px';
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+    if (cw) { tf.cx = (W / 2 - tf.x) / cw; tf.cy = (H / 2 - tf.y) / ch; }
+    zout.disabled = st.view === 'world' && tf.s <= 1.001;
+    zfit.disabled = tf.s <= 1.001;
+    if (st.view === 'top' && !tileRaf) tileRaf = requestAnimationFrame(() => { tileRaf = 0; drawTiles(); });
+  }
+  const fracAt = (px, py) => ({ fx: (px - tf.x) / (tf.w * tf.s), fy: (py - tf.y) / (tf.h * tf.s) });
+  const at = (e) => { const r = view.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  function zoomAt(px, py, s) {
+    const f = fracAt(px, py);
+    tf.s = Math.max(1, Math.min(Math.max(capAt(px, py), tf.s), s));
+    tf.x = px - f.fx * tf.w * tf.s;
+    tf.y = py - f.fy * tf.h * tf.s;
+    applyTf();
+  }
+  function zoomAnim(px, py, s, then) {
+    cancelAnimationFrame(anim);
+    const s0 = tf.s, s1 = Math.max(1, Math.min(Math.max(capAt(px, py), tf.s), s)), f = fracAt(px, py), t0 = performance.now();
+    const step = (t) => {
+      const p = Math.min(1, (t - t0) / 220), k = 1 - (1 - p) ** 3;
+      tf.s = s0 * (s1 / s0) ** k;
+      tf.x = px - f.fx * tf.w * tf.s;
+      tf.y = py - f.fy * tf.h * tf.s;
+      applyTf();
+      if (p < 1) anim = requestAnimationFrame(step); else if (then) then();
+    };
+    anim = requestAnimationFrame(step);
+  }
+
+  // ---- уровни: материк → зоны → города в зонах
+  const rectIn = (pb, b) => { const a = toFrac(pb, b[2], b[0]), c = toFrac(pb, b[3], b[1]); return [a.fx, a.fy, c.fx, c.fy]; };
+  const zoneSize = (z) => Math.abs((z.bounds[0] - z.bounds[1]) * (z.bounds[2] - z.bounds[3]));
+  // столица — уровень ниже своей зоны (область столицы → область зоны). По рамкам карт не угадать:
+  // рамка Степей «вмещает» и Дуротар, и Мулгор
+  const CITY_IN = { 1519: 12, 1537: 1, 1657: 141, 1637: 14, 1638: 215, 1497: 85 };
+  const parentOf = (z) => (CITY_IN[z.area] ? man.zones.find((p) => p.map === z.map && p.area === CITY_IN[z.area]) || null : null);
+  const curBounds = () => (st.view === 'zone' ? st.zone.bounds : st.cont.bounds);
+  const kids = () => (st.view === 'world' || st.view === 'top' ? [] : man.zones.filter((z) => z.map === st.cont.map && parentOf(z) === (st.view === 'zone' ? st.zone : null)));
+  // зона уровнем ниже под точкой: из тех, в чью рамку она попала, — ближайшая к центру рамки
+  function kidAt(f) {
+    let best = null;
+    for (const z of kids()) {
+      const r = rectIn(curBounds(), z.bounds);
+      if (f.fx < r[0] || f.fx > r[2] || f.fy < r[1] || f.fy > r[3]) continue;
+      const d = Math.hypot((f.fx - (r[0] + r[2]) / 2) / (r[2] - r[0]), (f.fy - (r[1] + r[3]) / 2) / (r[3] - r[1]));
+      if (!best || d < best.d) best = { z, r, d };
+    }
+    return best;
+  }
+  const contAt = (f) => man.continents.find((c) => f.fx >= c.hit[0] && f.fx <= c.hit[2] && f.fy >= c.hit[1] && f.fy <= c.hit[3]);
+  // приблизить можно до ×6 (карту зоны — до ×4), а над зоной уровнем ниже — пока она не встанет во весь экран
+  function capAt(px, py) {
+    if (st.view === 'top') return (4 * st.aspect[0]) / tf.w;      // до ×4 к самой мини-карте
+    const hit = st.view === 'world' ? null : kidAt(fracAt(px, py));
+    return Math.max(st.view === 'world' ? 2.5 : st.view === 'zone' ? 4 : 6, hit ? 1.15 / (hit.r[2] - hit.r[0]) : 0);
+  }
+  // новый уровень: окно выше для вида сверху, размер картинки по её сторонам; at — сдвиг {s, x, y},
+  // зона {zone} во весь экран или мировая точка {X, Y, ypp, px, py}, которая встанет под (px, py)
+  function setLevel(at) {
+    lastSwitch = Date.now();
+    cancelAnimationFrame(anim);
+    view.classList.toggle('top', st.view === 'top');
+    fitBase();
+    const t = resolve(at);
+    tf.s = Math.max(1, t ? t.s : 1);
+    tf.x = t ? t.x : 0;
+    tf.y = t ? t.y : 0;
+    applyTf();
+    canvas.classList.remove('fade');
+    canvas.getBoundingClientRect();
+    canvas.classList.add('fade');
+  }
+  // зона под курсором встала почти во весь экран — открыть её карту; точка под курсором остаётся на месте
+  function goDown(px, py) {
+    if (st.view === 'world' || Date.now() - lastSwitch < 450) return;
+    const f = fracAt(px, py), hit = kidAt(f);
+    if (!hit || tf.s * (hit.r[2] - hit.r[0]) < 0.9) return;
+    const r = hit.r, s = tf.s * (r[2] - r[0]);
+    const fz = { fx: (f.fx - r[0]) / (r[2] - r[0]), fy: (f.fy - r[1]) / (r[3] - r[1]) };
+    showZone(hit.z, null, { s, x: px - fz.fx * tf.w * Math.max(1, s), y: py - fz.fy * tf.h * Math.max(1, s) });
+  }
+  // карту отдалили до конца — уровень выше, эта зона там во весь экран
+  function goUp(px, py) {
+    if (Date.now() - lastSwitch < 450) return;
+    if (st.view === 'cont' || st.view === 'top') { showWorld(); return; }
+    if (st.view !== 'zone') return;
+    const z = st.zone, p = parentOf(z);
+    const r = rectIn(p ? p.bounds : st.cont.bounds, z.bounds);
+    const f = fracAt(px, py);
+    const pf = { fx: r[0] + f.fx * (r[2] - r[0]), fy: r[1] + f.fy * (r[3] - r[1]) };
+    const s = tf.s / (r[2] - r[0]);
+    const t = { s, x: px - pf.fx * tf.w * s, y: py - pf.fy * tf.h * s };
+    if (p) showZone(p, null, t); else showCont(st.cont, t);
+  }
 
   const hint = (text) => fill(info, h('p', { class: 'muted small' }, text));
-  const bounds = () => (st.view === 'zone' ? st.zone.bounds : st.view === 'cont' ? st.cont.bounds : null);
-  const mapId = () => (st.view === 'zone' ? st.zone.map : st.view === 'cont' ? st.cont.map : null);
+  const bounds = () => (st.view === 'zone' ? st.zone.bounds : st.view === 'cont' ? st.cont.bounds : st.view === 'top' ? st.top.bounds : null);
+  const mapId = () => (st.view === 'zone' ? st.zone.map : st.view === 'cont' ? st.cont.map : st.view === 'top' ? st.top.map : null);
+  // мировая точка под (px, py) и сколько ярдов в точке экрана — чтобы другой вид открылся на том же месте
+  function worldAt(px, py) {
+    const b = bounds(), f = fracAt(px, py);
+    return { Y: b[0] - f.fx * (b[0] - b[1]), X: b[2] - f.fy * (b[2] - b[3]), ypp: (b[0] - b[1]) / (tf.w * tf.s), px, py };
+  }
+  function resolve(at) {
+    if (!at || at.s != null) return at;
+    const b = bounds();
+    if (at.zone) {
+      const r = rectIn(b, at.zone.bounds);
+      const s = 0.95 * Math.min(vw() / ((r[2] - r[0]) * tf.w), vh() / ((r[3] - r[1]) * tf.h));
+      return { s, x: vw() / 2 - ((r[0] + r[2]) / 2) * tf.w * s, y: vh() / 2 - ((r[1] + r[3]) / 2) * tf.h * s };
+    }
+    const s = (b[0] - b[1]) / (tf.w * at.ypp);
+    return { s, x: at.px - ((b[0] - at.Y) / (b[0] - b[1])) * tf.w * s, y: at.py - ((b[2] - at.X) / (b[2] - b[3])) * tf.h * s };
+  }
+
+  // ---- вид сверху: квадрат местности (c, r) мини-карты — 533⅓ ярда, его северо-западный угол в мире
+  // X = (32 − r)·533⅓, Y = (32 − c)·533⅓. Плитка уровня z — 2^(top − z) квадратов по стороне.
+  const tileEls = new Map();
+  let tileRaf = 0;
+  function topMap(mapid) {
+    const m = mini.maps[mapid], T = mini.yards, [c0, r0, c1, r1] = m.box;
+    if (!m.have) m.have = new Set(Object.entries(m.tiles).flatMap(([z, list]) => list.map((k) => `${z}/${k}`)));
+    return { map: Number(mapid), m, box: m.box, bounds: [(32 - c0) * T, (32 - c1) * T, (32 - r0) * T, (32 - r1) * T],
+      aspect: [(c1 - c0) * mini.tile, (r1 - r0) * mini.tile] };
+  }
+  function drawTiles() {
+    if (st.view !== 'top') {
+      if (tileEls.size) { fill(tilesEl); tileEls.clear(); }
+      return;
+    }
+    const { m, box, map } = st.top, [c0, r0, c1, r1] = box, nc = c1 - c0, nr = r1 - r0, top = mini.top;
+    // уровень, где точка плитки не крупнее точки экрана; под ним — грубый, пока грузятся подробные
+    const sp = (tf.w * tf.s) / (nc * mini.tile);
+    const zc = Math.max(0, Math.min(top, Math.ceil(top + Math.log2(sp) - 0.25)));
+    const a = fracAt(0, 0), b = fracAt(vw(), vh());
+    const need = new Set();
+    for (const z of new Set([Math.max(0, zc - 3), zc])) {
+      const k = 2 ** (top - z);
+      for (let tx = Math.floor((c0 + a.fx * nc) / k); tx <= Math.floor((c0 + b.fx * nc) / k); tx++) {
+        for (let ty = Math.floor((r0 + a.fy * nr) / k); ty <= Math.floor((r0 + b.fy * nr) / k); ty++) {
+          const key = `${z}/${tx}_${ty}`;
+          if (!m.have.has(key)) continue;
+          need.add(key);
+          if (tileEls.has(key)) continue;
+          const el = h('img', { class: 'wm-tile', alt: '', draggable: 'false' });
+          el.onload = () => el.classList.add('on');
+          el.style.zIndex = String(z);
+          el.style.left = (((tx * k - c0) / nc) * 100).toFixed(4) + '%';
+          el.style.top = (((ty * k - r0) / nr) * 100).toFixed(4) + '%';
+          el.style.width = `calc(${((k / nc) * 100).toFixed(4)}% + 1px)`;      // +1px — без щелей между плитками
+          el.style.height = `calc(${((k / nr) * 100).toFixed(4)}% + 1px)`;
+          el.src = `/static/wow/minimap/${map}/${key}.webp`;
+          tileEls.set(key, el);
+          tilesEl.append(el);
+        }
+      }
+    }
+    for (const [key, el] of tileEls) if (!need.has(key)) { el.remove(); tileEls.delete(key); }
+  }
+  function drawMode() {
+    fill(modeBox, mini ? seg([['art', L('Карта игры')], ['top', L('Вид сверху')]], st.mode, setMode) : null);
+  }
+  // сменить вид на том же месте: из карты игры — вид сверху того же материка, обратно — зона в центре окна
+  function setMode(k) {
+    if (k === st.mode) return;
+    st.mode = k;
+    pref.set('wm-mode', k);
+    drawMode();
+    if (st.view === 'world') return;
+    const w = worldAt(vw() / 2, vh() / 2);
+    if (k === 'top') { showTop(st.cont, w); return; }
+    const z = w.ypp < 12 && zoneAt(man, st.top.map, w.X, w.Y);
+    if (z) showZone(z, null, w); else showCont(st.cont, w);
+  }
 
   function drawCrumbs() {
     const link = (label, fn) => h('a', { href: '#', onclick: (e) => { e.preventDefault(); fn(); } }, label);
     const parts = [st.view === 'world' ? h('b', null, L('Мир')) : link(L('Мир'), showWorld)];
     if (st.cont) parts.push(' › ', st.view === 'cont' ? h('b', null, mapTitle(st.cont)) : link(mapTitle(st.cont), () => showCont(st.cont)));
-    if (st.view === 'zone') parts.push(' › ', h('b', null, mapTitle(st.zone)));
+    if (st.view === 'zone') {
+      const p = parentOf(st.zone);
+      if (p) parts.push(' › ', link(mapTitle(p), () => showZone(p)));
+      parts.push(' › ', h('b', null, mapTitle(st.zone)));
+    }
+    if (st.view === 'top') {
+      parts[parts.length - 1] = h('b', null, mapTitle(st.cont));
+      const other = man.continents.find((c) => c.map !== st.cont.map);
+      if (other) parts.push(h('span', { class: 'muted' }, ' · '), link(mapTitle(other), () => showTop(other)));
+    }
     fill(crumbs, ...parts);
     zoneSel.value = st.view === 'zone' ? String(st.zone.id) : '';
   }
@@ -4579,14 +4848,22 @@ function worldMapView(opts = {}) {
     if (st.view === 'zone') for (const t of p.tele) add('tele', t.x, t.y, L('Точка телепорта: {0}', t.name));
     for (const o of p.online) add('pl ' + (o.faction || ''), o.x, o.y, `${o.name} · ${o.level} · ${o.race_name} ${o.class_name}`);
     if (p.char && p.char.map === mapId()) add('me', p.char.x, p.char.y, L('{0} сейчас здесь', p.char.name));
+    for (const m of opts.marks || []) if (m.map === mapId()) add('ev ' + (m.cls || ''), m.x, m.y, m.title);
   }
 
   async function render(file) {
     fill(layer);
     mark = null;
-    img.src = `/static/wow/maps/${file}.webp`;
+    img.hidden = !file;
+    const src = `/static/wow/maps/${file}.webp`;
+    if (file && !img.src.endsWith(src)) {
+      img.classList.add('loading');
+      img.onload = img.onerror = () => img.classList.remove('loading');
+      img.src = src;
+    }
+    drawTiles();
     drawCrumbs();
-    layer.classList.toggle('pick', st.view === 'zone');
+    layer.classList.toggle('pick', (st.view === 'zone' || st.view === 'top') && !opts.readonly);
     if (mapId() != null) {
       try { drawPins(await loadPins(mapId())); } catch (e) { toast(e.message, true); }
     }
@@ -4601,42 +4878,55 @@ function worldMapView(opts = {}) {
   }
 
   function showWorld() {
-    Object.assign(st, { view: 'world', cont: null, zone: null });
+    Object.assign(st, { view: 'world', cont: null, zone: null, aspect: [1002, 668] });
+    setLevel(null);
     render(man.world.file);
     for (const c of man.continents) layer.append(hitBox(c.hit, mapTitle(c), () => showCont(c)));
-    hint(L('Выберите материк. Можно сразу выбрать зону из списка над картой.'));
+    hint(L('Выберите материк — щёлкните по нему или приблизьте колёсиком. Можно сразу выбрать зону из списка над картой.'));
   }
 
-  async function showCont(c) {
-    Object.assign(st, { view: 'cont', cont: c, zone: null });
+  async function showCont(c, t) {
+    if (st.mode === 'top' && mini) { await showTop(c, t && t.s == null ? t : null); return; }
+    Object.assign(st, { view: 'cont', cont: c, zone: null, aspect: [1002, 668] });
+    setLevel(t);
     await render(c.file);
     // большие зоны — под маленькими (города внутри зон), иначе до города не дотянуться
-    const zones = man.zones.filter((zz) => zz.map === c.map)
-      .sort((a, b) => Math.abs((b.bounds[0] - b.bounds[1]) * (b.bounds[2] - b.bounds[3])) - Math.abs((a.bounds[0] - a.bounds[1]) * (a.bounds[2] - a.bounds[3])));
+    const zones = man.zones.filter((zz) => zz.map === c.map).sort((a, b) => zoneSize(b) - zoneSize(a));
     const pins = [...layer.children];
-    for (const z of zones) {
-      const a = toFrac(c.bounds, z.bounds[2], z.bounds[0]);
-      const b = toFrac(c.bounds, z.bounds[3], z.bounds[1]);
-      layer.append(hitBox([a.fx, a.fy, b.fx, b.fy], mapTitle(z), () => showZone(z)));
-    }
+    for (const z of zones) layer.append(hitBox(rectIn(c.bounds, z.bounds), mapTitle(z), () => showZone(z)));
     layer.append(...pins);
-    hint(L('Выберите зону — наведите на неё и щёлкните.'));
+    hint(L('Выберите зону: щёлкните по ней или приблизьте колёсиком — её карта откроется сама.'));
   }
 
-  async function showZone(z, point) {
-    Object.assign(st, { view: 'zone', zone: z, cont: man.continents.find((c) => c.map === z.map) || null });
+  async function showZone(z, point, t) {
+    const cont = man.continents.find((c) => c.map === z.map) || null;
+    if (st.mode === 'top' && mini && cont) {
+      await showTop(cont, point ? { zone: z } : t && t.s == null ? t : { zone: z });
+      if (point) pick(point.x, point.y, point.z);
+      return;
+    }
+    Object.assign(st, { view: 'zone', zone: z, cont, aspect: [1002, 668] });
+    setLevel(t);
     await render(z.file);
     if (point) pick(point.x, point.y, point.z);
-    else hint(L('Щёлкните по месту на карте — панель найдёт высоту земли в этой точке.'));
+    else hint(opts.note || L('Щёлкните по месту на карте — панель найдёт высоту земли в этой точке.'));
+  }
+
+  async function showTop(c, at) {
+    const top = topMap(c.map);
+    Object.assign(st, { view: 'top', cont: c, zone: null, top, aspect: top.aspect });
+    setLevel(at);
+    await render(null);
+    hint(opts.note || L('Вид сверху — мини-карты игры. Колёсиком можно приблизить до отдельных деревьев; щёлкните по месту — панель найдёт высоту земли.'));
   }
 
   async function pick(x, y, zManual) {
-    const f = toFrac(st.zone.bounds, x, y);
+    const f = toFrac(bounds(), x, y);
     if (!mark) mark = h('i', { class: 'wm-mark' });
     layer.append(placeAt(mark, f.fx, f.fy));
     fill(info, h('p', { class: 'muted small' }, L('Ищу высоту…')));
     try {
-      const p = (await api(`/api/map/point?map=${st.zone.map}&x=${x.toFixed(2)}&y=${y.toFixed(2)}`)).data;
+      const p = (await api(`/api/map/point?map=${mapId()}&x=${x.toFixed(2)}&y=${y.toFixed(2)}`)).data;
       if (zManual != null && zManual !== '' && Number.isFinite(Number(zManual))) {
         p.z = Math.round(Number(zManual) * 100) / 100;
         p.source = 'manual';
@@ -4645,11 +4935,12 @@ function worldMapView(opts = {}) {
       const src = p.source === 'npc' ? L('на уровне НПС «{0}» ({1} м от точки)', p.near.name, Math.round(p.near.dist))
         : p.source === 'water' ? L('на поверхности воды') : p.source === 'ground' ? L('по высоте земли')
           : p.source === 'manual' ? L('введена вручную') : null;
-      const zf = toFrac(st.zone.bounds, p.x, p.y);
-      fill(info, 
-        h('div', null, h('b', null, placeTitle(p, mapTitle(st.zone)))),
+      const pz = st.view === 'zone' ? st.zone : zoneAt(man, p.map, p.x, p.y);
+      const zf = pz && toFrac(pz.bounds, p.x, p.y);
+      fill(info,
+        h('div', null, h('b', null, placeTitle(p, pz ? mapTitle(pz) : MAP_CONT[p.map]))),
         facts([[L('Карта'), MAP_CONT[p.map]], ['X · Y · Z', `${p.x} · ${p.y} · ${p.z == null ? '—' : p.z}`],
-               [L('В зоне, %'), `${(zf.fx * 100).toFixed(1)}, ${(zf.fy * 100).toFixed(1)}`], [L('Высота'), src || '—'],
+               [L('В зоне, %'), zf ? `${(zf.fx * 100).toFixed(1)}, ${(zf.fy * 100).toFixed(1)}` : '—'], [L('Высота'), src || '—'],
                p.near && p.source !== 'npc' ? [L('Ближайший НПС'), L('{0} — {1} м', p.near.name, Math.round(p.near.dist))] : null]),
         p.z == null ? h('p', { class: 'warn-text small' }, L('Здесь нет земли: здание, пещера или край карты. Щёлкните рядом или поближе к НПС.')) : null,
         opts.extra ? opts.extra(p) : null,
@@ -4659,10 +4950,111 @@ function worldMapView(opts = {}) {
     }
   }
 
+  // ---- мышь, пальцы, клавиши
+  view.addEventListener('wheel', (e) => {
+    if (!man) return;
+    e.preventDefault();
+    const [px, py] = at(e);
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 300 : e.deltaY;
+    const k = Math.exp(-Math.max(-250, Math.min(250, dy)) * 0.0016);
+    if (k < 1) {
+      if (tf.s <= 1.001) goUp(px, py); else zoomAt(px, py, tf.s * k);
+      return;
+    }
+    if (st.view === 'world') {
+      const c = contAt(fracAt(px, py));
+      if (c && tf.s * k >= 1.5 && Date.now() - lastSwitch > 450) { showCont(c); return; }
+    }
+    if (st.view === 'zone' && mini && tf.s >= capAt(px, py) - 0.01 && !kidAt(fracAt(px, py))) {
+      if (Date.now() - lastSwitch > 450) { st.mode = 'top'; pref.set('wm-mode', 'top'); drawMode(); showTop(st.cont, worldAt(px, py)); }
+      return;
+    }
+    zoomAt(px, py, tf.s * k);
+    goDown(px, py);
+  }, { passive: false });
+
+  // тянуть — сдвиг; щелчок после сдвига не считается щелчком по карте
+  const ptrs = new Map();
+  let drag = null;
+  let pinch = null;
+  let moved = false;
+  view.addEventListener('pointerdown', (e) => {
+    if ((e.pointerType === 'mouse' && e.button !== 0) || e.target.closest('.wm-zoom')) return;
+    ptrs.set(e.pointerId, at(e));
+    moved = false;
+    cancelAnimationFrame(anim);
+    drag = ptrs.size === 1 ? { p: at(e), x: tf.x, y: tf.y } : null;
+    pinch = null;
+  });
+  view.addEventListener('pointermove', (e) => {
+    if (!ptrs.has(e.pointerId)) return;
+    const p = at(e);
+    ptrs.set(e.pointerId, p);
+    if (ptrs.size >= 2) {
+      const [a, b] = [...ptrs.values()];
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]), m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      if (pinch && d > 0 && pinch.d > 0) {
+        tf.x += m[0] - pinch.m[0];
+        tf.y += m[1] - pinch.m[1];
+        if (d < pinch.d && tf.s <= 1.001) goUp(m[0], m[1]);
+        else zoomAt(m[0], m[1], tf.s * d / pinch.d);
+        if (d > pinch.d) goDown(m[0], m[1]);
+      }
+      pinch = { d, m };
+      moved = true;
+      return;
+    }
+    if (!drag) return;
+    const dx = p[0] - drag.p[0], dy = p[1] - drag.p[1];
+    if (!moved && Math.hypot(dx, dy) < 5) return;
+    if (!moved) { moved = true; view.setPointerCapture(e.pointerId); view.classList.add('drag'); }
+    tf.x = drag.x + dx;
+    tf.y = drag.y + dy;
+    applyTf();
+  });
+  const release = (e) => {
+    ptrs.delete(e.pointerId);
+    if (ptrs.size < 2) pinch = null;
+    if (!ptrs.size) { drag = null; view.classList.remove('drag'); }
+  };
+  view.addEventListener('pointerup', release);
+  view.addEventListener('pointercancel', release);
+  view.addEventListener('click', (e) => { if (moved) { e.stopPropagation(); e.preventDefault(); moved = false; } }, true);
+  view.addEventListener('dblclick', (e) => {
+    if (!man || e.target.closest('.wm-zoom') || Date.now() - lastSwitch < 500) return;
+    const [px, py] = at(e);
+    zoomAnim(px, py, tf.s * 2, () => goDown(px, py));
+  });
+  zin.addEventListener('click', () => {
+    const px = vw() / 2, py = vh() / 2;
+    zoomAnim(px, py, tf.s * 1.6, () => goDown(px, py));
+  });
+  zout.addEventListener('click', () => {
+    const px = vw() / 2, py = vh() / 2;
+    if (tf.s <= 1.001) goUp(px, py); else zoomAnim(px, py, tf.s / 1.6);
+  });
+  zfit.addEventListener('click', () => zoomAnim(vw() / 2, vh() / 2, 1));
+  view.addEventListener('keydown', (e) => {
+    const step = { ArrowLeft: [80, 0], ArrowRight: [-80, 0], ArrowUp: [0, 80], ArrowDown: [0, -80] }[e.key];
+    if (e.key === '+' || e.key === '=') zin.click();
+    else if (e.key === '-' || e.key === '_') zout.click();
+    else if (step) { tf.x += step[0]; tf.y += step[1]; applyTf(); } else return;
+    e.preventDefault();
+  });
+  // окно поменяло размер — та же точка остаётся в центре
+  new ResizeObserver(() => {
+    if (!vw()) return;
+    const { cx, cy } = tf;
+    fitBase();
+    tf.x = vw() / 2 - cx * tf.w * tf.s;
+    tf.y = vh() / 2 - cy * tf.h * tf.s;
+    applyTf();
+  }).observe(view);
+
   layer.addEventListener('click', (e) => {
-    if (st.view !== 'zone') return;
+    if ((st.view !== 'zone' && st.view !== 'top') || opts.readonly || e.detail > 1) return;
     const r = canvas.getBoundingClientRect();
-    const w = toWorld(st.zone.bounds, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+    const w = toWorld(bounds(), (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
     pick(w.x, w.y);
   });
   layer.addEventListener('mousemove', (e) => {
@@ -4719,9 +5111,10 @@ function worldMapView(opts = {}) {
 
   const el = h('div', { class: 'wm' },
     h('div', { class: 'wm-main' },
-      h('div', { class: 'wm-tools' }, crumbs, h('span', { class: 'spacer' }), coords, zoneSel, zoomBtns),
+      h('div', { class: 'wm-tools' }, crumbs, h('span', { class: 'spacer' }), coords, modeBox, zoneSel),
       coordPanel,
-      scroller),
+      view,
+      h('div', { class: 'wm-help muted small' }, L('Колёсико — приблизить к курсору, тянуть мышью — сдвинуть, двойной щелчок — крупнее. Приблизили зону — откроется её карта, а приблизили её до конца — вид сверху; отдалили до конца — снова материк.'))),
     h('aside', { class: 'wm-side' }, info));
 
   const ctl = {
@@ -4744,12 +5137,16 @@ function worldMapView(opts = {}) {
     refresh() {
       st.pins = {};
       if (st.view === 'zone') { const p = st.point; render(st.zone.file).then(() => { if (p && p.map === st.zone.map) pick(p.x, p.y); }); }
+      else if (st.view === 'top') { const p = st.point; render(null).then(() => { if (p && p.map === st.top.map) pick(p.x, p.y); }); }
       else if (st.view === 'cont') showCont(st.cont);
     },
   };
 
   mapsManifest().then(async (m) => {
     man = m;
+    mini = await minimapManifest();
+    if (!mini) st.mode = 'art';
+    drawMode();
     const groups = man.continents.map((c) => h('optgroup', { label: mapTitle(c) },
       man.zones.filter((z) => z.map === c.map).sort((a, b) => mapTitle(a).localeCompare(mapTitle(b), LOCALE))
         .map((z) => h('option', { value: z.id }, mapTitle(z)))));
@@ -4758,10 +5155,30 @@ function worldMapView(opts = {}) {
       const z = zoneAt(man, opts.start.map, opts.start.x, opts.start.y);
       if (z) { await showZone(z, opts.start); return; }
     }
+    if (opts.open) {
+      const o = opts.open;
+      const z = o.zoneArea != null && (man.zones.find((zz) => zz.map === o.map && zz.area === o.zoneArea)
+        || (o.x != null && zoneAt(man, o.map, o.x, o.y)));
+      if (z) { await showZone(z); return; }
+      const c = man.continents.find((cc) => cc.map === o.map);
+      if (c) { await showCont(c); hint(opts.note || ''); return; }
+    }
     if (st.char) await ctl.setChar(st.char);
     if (!st.zone) showWorld();
   }).catch((e) => fill(info, h('p', { class: 'warn-text' }, e.message)));
   return ctl;
+}
+
+/* Плитки вида сверху (tools/build_minimap.py) — их может и не быть: тогда только карта игры */
+let miniData;
+async function minimapManifest() {
+  if (miniData === undefined) {
+    try {
+      const r = await fetch('/static/wow/minimap/minimap.json', { cache: 'force-cache' });
+      miniData = r.ok ? await r.json() : null;
+    } catch (e) { miniData = null; }
+  }
+  return miniData;
 }
 
 /* Окно с картой: телепорт персонажа или выбор места (например, для НПС). */
@@ -4963,9 +5380,14 @@ function itemChip(it, extra, onRemove) {
   return bindItemTip(el, { entry: it.id, name: it.name, quality: it.quality, icon: it.icon });
 }
 
-function drawerBox(title, sub, onClose) {
-  const head = h('div', { class: 'drawer-h' }, h('div', { class: 'grow' }, h('h2', null, title), sub ? h('div', { class: 'sub' }, sub) : null),
-    h('button', { class: 'btn ghost sm x', type: 'button', 'aria-label': L('Закрыть'), onclick: onClose }, icon('x')));
+/* back — карточка, из которой сюда перешли: { label, closeAll } (она открыта под этой) */
+function drawerBox(title, sub, onClose, back) {
+  const head = h('div', { class: 'drawer-h' },
+    back ? h('button', { class: 'btn sm drawer-back', type: 'button', title: L('Назад: {0}', back.label), onclick: () => onClose() },
+      icon('back'), h('span', null, back.label)) : null,
+    h('div', { class: 'grow' }, h('h2', null, title), sub ? h('div', { class: 'sub' }, sub) : null),
+    h('button', { class: 'btn ghost sm x', type: 'button', 'aria-label': back ? L('Закрыть всё') : L('Закрыть'), title: back ? L('Закрыть всё') : null,
+      onclick: () => { if (back) back.closeAll(); onClose(); } }, icon('x')));
   return head;
 }
 
@@ -5615,6 +6037,665 @@ PAGES.audit = {
     };
     setTools(refreshBtn(() => load().catch((e) => toast(e.message, true))));
     await load();
+  },
+};
+
+// ============================================================ События и праздники
+/* Календарь событий мира (game_event): праздники, ярмарки, выходные полей боя, вторжения.
+   Расписание считает panel.py тем же кодом, что ядро (GameEventMgr). Включить и выключить —
+   event start / event stop; «держать включённым / выключенным до …» панель помнит сама и
+   раз в минуту сверяет с ядром. У каждого события — своя тема оформления: цвет, узор
+   (картинки SVG прямо в app.css) и иконка игры; в карточке — кто из НПС появится. */
+
+const EV_CATS = [['holiday', L('Праздники')], ['fair', L('Ярмарки и забавы')], ['pvp', L('Поля боя')],
+  ['world', L('События мира')], ['service', L('Служебные')], ['other', L('Другие')]];
+const EV_CAT = Object.fromEntries(EV_CATS);
+const DAY = 86400;
+
+const evMain = (e) => !e.parent && e.cat !== 'service';
+const evOn = (e) => (e.active == null ? e.scheduled : e.active);
+
+function evDur(min) {
+  if (!min) return '—';
+  if (min % 1440 === 0) return L('{0} дн.', min / 1440);
+  if (min >= 1440) return L('{0} дн. {1} ч', Math.floor(min / 1440), Math.round((min % 1440) / 60));
+  if (min % 60 === 0) return L('{0} ч', min / 60);
+  return min > 60 ? L('{0} ч {1} мин', Math.floor(min / 60), min % 60) : L('{0} мин', min);
+}
+
+function evSchedule(e) {
+  const len = evDur(e.length);
+  if (e.schedule_type === 0) return L('Своего расписания нет — включает скрипт ядра или вы вручную');
+  if (!e.occurence || !e.length || e.occurence < e.length) return L('Отключено в базе мира');
+  if (e.schedule_type === 11) return L('Каждый год в одни и те же числа, длится {0}', len);
+  if (e.schedule_type === 12) return L('Каждый год со второго новолуния после зимнего солнцестояния, длится {0}', len);
+  if (e.schedule_type === 13) return L('Каждый год с Пасхи, длится {0}', len);
+  if (e.schedule_type >= 2 && e.schedule_type <= 9) return L('По первым понедельникам месяцев, длится {0}', len);
+  const occ = e.occurence;
+  if (occ === 525600) return L('Раз в 365 дней, длится {0}', len);
+  if (occ === 10080) return L('Каждую неделю, длится {0}', len);
+  if (occ === 1440) return L('Каждый день, длится {0}', len);
+  if (occ === 60) return L('Каждый час, длится {0}', len);
+  return L('Каждые {0}, длится {1}', evDur(occ), len);
+}
+
+// Окно [начало, конец): конец ровно в полночь показываем прошедшим днём
+function evRange(w) {
+  if (!w) return '—';
+  const [s, e] = w;
+  if (e - s < DAY) return `${fmtDT(s)} – ${new Date(e * 1000).toLocaleTimeString(LOCALE, { hour: '2-digit', minute: '2-digit' })}`;
+  return `${fmtD(s)} – ${fmtD(e - 1)}`;
+}
+
+function evIn(sec) {
+  if (sec < 3600) return L('через {0} мин', Math.max(1, Math.round(sec / 60)));
+  if (sec < DAY) return L('через {0} ч', Math.round(sec / 3600));
+  return L('через {0} дн.', Math.round(sec / DAY));
+}
+
+function evLeft(sec) {
+  if (sec < 3600) return L('ещё {0} мин', Math.max(1, Math.round(sec / 60)));
+  if (sec < DAY) return L('ещё {0} ч', Math.round(sec / 3600));
+  return L('ещё {0} дн.', Math.round(sec / DAY));
+}
+
+/* Что с событием сейчас: идёт ли и почему — по расписанию, вручную или его держит панель */
+function evStatus(e) {
+  const f = e.force;
+  if (f) {
+    const till = f.until ? L(' до {0}', fmtDT(f.until)) : '';
+    if (f.kind === 'run') return f.mode === 'on' ? [L('включено вручную') + till, 'acc'] : [L('выключено вручную') + till, 'warn'];
+    return f.mode === 'on' ? [L('держит панель: включено') + till, 'acc'] : [L('держит панель: выключено') + till, 'warn'];
+  }
+  if (e.active == null) return e.scheduled ? [L('по расписанию идёт'), 'ok'] : [L('по расписанию не идёт'), null];
+  if (e.active && e.scheduled) return [L('идёт'), 'ok'];
+  if (e.active) return [L('включено вручную'), 'acc'];
+  if (e.scheduled) return [L('выключено вручную'), 'warn'];
+  return [L('не идёт'), null];
+}
+
+function evBadge(e) { const [t, k] = evStatus(e); return badge(t, k); }
+
+function evIcon(e, size = 'l') { return h('span', { class: `ev-ico ev-t-${e.theme}` }, gicon(e.icon, size, e.name)); }
+
+/* ---------- карточка «сейчас идёт» */
+
+function evNowCard(e, now, open) {
+  const left = e.current ? e.current[1] - now : null;
+  return h('button', { class: `ev-now ev-t-${e.theme}`, type: 'button', onclick: () => open(e.entry) },
+    gicon(e.icon, 'xl'),
+    h('span', { class: 'ev-now-t' },
+      h('b', null, e.name),
+      h('small', null, e.current ? `${evRange(e.current)} · ${evLeft(left)}`
+        : e.force && e.force.until ? L('включено вручную · {0}', evLeft(e.force.until - now)) : L('включено вручную')),
+      h('span', null, evBadge(e))));
+}
+
+/* ---------- месяц: сетка 7×6, полосы событий идут через дни */
+
+function evMonthView(st, list, open) {
+  const first = new Date(st.year, st.month, 1);
+  const shift = (first.getDay() + 6) % 7;                    // неделя с понедельника
+  const start = new Date(st.year, st.month, 1 - shift);
+  const days = [...Array(42)].map((_, i) => new Date(start.getFullYear(), start.getMonth(), start.getDate() + i));
+  const t0 = days[0].getTime() / 1000, t1 = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 42).getTime() / 1000;
+  // каждое окно события — на свою дорожку: первая свободная к его началу (так полосы не прыгают по строкам)
+  const items = list.flatMap((e) => e.windows.filter(([s, en]) => en > t0 && s < t1).map((w) => ({ e, w })))
+    .sort((a, b) => a.w[0] - b.w[0] || b.w[1] - a.w[1]);
+  const laneEnd = [];
+  for (const it of items) {
+    let i = laneEnd.findIndex((end) => end <= it.w[0]);
+    if (i < 0) { i = laneEnd.length; laneEnd.push(0); }
+    laneEnd[i] = it.w[1];
+    it.lane = i;
+  }
+  const MAXL = 6;
+  const nl = Math.min(laneEnd.length, MAXL);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const wd = [...Array(7)].map((_, i) => new Date(2024, 0, 1 + i).toLocaleDateString(LOCALE, { weekday: 'short' }));
+  const cells = days.map((d, i) => {
+    const ds = d.getTime() / 1000, de = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() / 1000;
+    const here = items.filter((it) => it.w[1] > ds && it.w[0] < de);
+    const bars = [...Array(nl)].map((_, lane) => {
+      const it = here.find((x) => x.lane === lane);
+      if (!it) return h('div', { class: 'evb none' });
+      const { e, w: win } = it;
+      const isStart = win[0] >= ds, isEnd = win[1] <= de;
+      const label = isStart || i % 7 === 0 || d.getDate() === 1;
+      return h('button', { class: `evb ev-t-${e.theme}${isStart ? ' s' : ''}${isEnd ? ' e' : ''}`, type: 'button', title: `${e.name}\n${evRange(win)}`,
+        onclick: () => open(e.entry) }, label ? [gicon(e.icon, 's'), h('span', null, e.name)] : null);
+    });
+    const more = here.filter((x) => x.lane >= MAXL).length;
+    return h('div', { class: 'evm-d' + (d.getMonth() !== st.month ? ' out' : '') + (d.getTime() === today.getTime() ? ' today' : '') },
+      h('span', { class: 'evm-n' }, d.getDate()), h('div', { class: 'evm-bars' }, bars),
+      more ? h('span', { class: 'evm-more' }, L('ещё {0}', more)) : null);
+  });
+  return h('div', { class: 'evm' }, wd.map((w) => h('div', { class: 'evm-w' }, w)), cells);
+}
+
+/* ---------- год: полосы на 12 месяцев */
+
+function evYearView(st, list, open, now) {
+  const y0 = new Date(st.year, 0, 1).getTime() / 1000, y1 = new Date(st.year + 1, 0, 1).getTime() / 1000;
+  const pct = (t) => Math.max(0, Math.min(100, ((t - y0) / (y1 - y0)) * 100));
+  const months = [...Array(12)].map((_, m) => {
+    const a = new Date(st.year, m, 1).getTime() / 1000, b = new Date(st.year, m + 1, 1).getTime() / 1000;
+    return h('div', { class: 'evy-m', style: `left:${pct(a)}%;width:${pct(b) - pct(a)}%` },
+      new Date(st.year, m, 1).toLocaleDateString(LOCALE, { month: 'short' }));
+  });
+  const nowLine = now >= y0 && now < y1 ? h('div', { class: 'evy-now', style: `left:${pct(now)}%`, title: L('сегодня') }) : null;
+  const rows = list.filter((e) => e.windows.some(([s, en]) => en > y0 && s < y1)).map((e) =>
+    h('div', { class: 'evy-r' },
+      h('button', { class: 'evy-l', type: 'button', onclick: () => open(e.entry) }, gicon(e.icon, 's'), h('span', null, e.name)),
+      h('div', { class: 'evy-t' }, e.windows.filter(([s, en]) => en > y0 && s < y1).map((w) =>
+        h('button', { class: `evy-b ev-t-${e.theme}`, type: 'button', title: `${e.name}\n${evRange(w)}`, onclick: () => open(e.entry),
+          style: `left:${pct(w[0])}%;width:max(4px, ${pct(w[1]) - pct(w[0])}%)` })), nowLine ? nowLine.cloneNode() : null)));
+  if (!rows.length) return h('div', { class: 'empty' }, L('В этом году таких событий по расписанию нет.'));
+  return h('div', { class: 'evy' }, h('div', { class: 'evy-r head' }, h('div', { class: 'evy-l' }), h('div', { class: 'evy-t' }, months, nowLine)), rows);
+}
+
+/* ---------- все события: плитки по 5–6 в ряд, разделы сворачиваются (что свёрнуто — помнит браузер) */
+
+function evTile(e, open, quick, now) {
+  const when = e.current ? L('идёт · {0}', evLeft(e.current[1] - now))
+    : e.next ? `${fmtD(e.next[0])} · ${evIn(e.next[0] - now)}` : L('нет в расписании');
+  return h('div', { class: `ev-tile ev-t-${e.theme}${evOn(e) ? ' on' : ''}`, role: 'button', tabindex: 0, title: evSchedule(e),
+    onclick: () => open(e.entry), onkeydown: (ev) => { if (ev.key === 'Enter') open(e.entry); } },
+    h('div', { class: 'ev-tile-top' }, gicon(e.icon, 'l'), evBadge(e)),
+    h('b', { class: 'ev-tile-n' }, e.name),
+    h('span', { class: 'ev-tile-w' }, when),
+    e.active == null ? null : h('button', { class: 'btn sm ev-tile-b', type: 'button', onclick: (ev) => { ev.stopPropagation(); quick(e, !evOn(e)); } },
+      icon(evOn(e) ? 'pause' : 'play'), evOn(e) ? L('Выключить') : L('Включить')));
+}
+
+function evListView(list, open, quick, now) {
+  const groups = EV_CATS.map(([cat, title]) => [cat, title, list.filter((e) => e.cat === cat)]).filter(([, , items]) => items.length);
+  if (!groups.length) return h('div', { class: 'empty' }, L('Нет событий в выбранных разделах.'));
+  const folded = new Set(pref.get('ev-fold', '').split(',').filter(Boolean));
+  return h('div', { class: 'stack tight' }, groups.map(([cat, title, items]) => {
+    const on = items.filter(evOn).length;
+    const box = h('details', { class: 'ev-group', open: !folded.has(cat) || null },
+      h('summary', null, h('b', null, title), h('span', { class: 'muted small' }, ` · ${L('{0} шт.', items.length)}`),
+        on ? badge(L('идёт: {0}', on), 'ok') : null),
+      h('div', { class: 'ev-tiles' }, items.map((e) => evTile(e, open, quick, now))));
+    box.addEventListener('toggle', () => {
+      if (box.open) folded.delete(cat); else folded.add(cat);
+      pref.set('ev-fold', [...folded].join(','));
+    });
+    return box;
+  }));
+}
+
+/* ---------- части события: как связаны с главным (panel.py, EVENT_ROLE)
+   core — ядро само включает часть в её время, но только пока идёт главное (linkedTo в базе);
+   during / before / after — у части свой календарь, ядро её с главным не связывает;
+   script — этап, который включает скрипт ядра. */
+
+const EV_PART = { core: [L('ядро включает само'), 'ok'], during: [L('свой календарь'), null], before: [L('подготовка'), null],
+  after: [L('после события'), null], script: [L('этап скрипта'), 'warn'] };
+const evClock = (t) => new Date(t * 1000).toLocaleTimeString(LOCALE, { hour: '2-digit', minute: '2-digit' });
+const evNames = (list) => list.map((c) => `«${c.name}»`).join(', ');
+const evNote = (text) => ({ node: h('div', { class: 'alert info' }, icon('events'), h('span', null, text)) });
+
+function evPartTime(e) {
+  const w = e.current || e.next;
+  if (!w || e.schedule_type === 0) return evSchedule(e);
+  if (e.occurence === 1440) return L('каждый день в {0}, {1}', evClock(w[0]), evDur(e.length));
+  if (e.occurence === 10080) return L('каждую неделю: {0} в {1}, {2}', new Date(w[0] * 1000).toLocaleDateString(LOCALE, { weekday: 'long' }), evClock(w[0]), evDur(e.length));
+  return L('по календарю: {0}', evRange(w));
+}
+
+function evPartNote(c, main) {
+  if (c.part === 'core') return L('Ядро включает её само в своё время — только пока идёт «{0}».', main);
+  if (c.part === 'script') return L('Этап, который включает скрипт ядра. Вручную — только если знаете зачем.');
+  if (c.part === 'before') return L('Готовит «{0}» по своему календарю. Пока «{0}» держат включённым, панель её не пускает.', main);
+  if (c.part === 'after') return L('Идёт после «{0}» по своему календарю.', main);
+  return L('Свой календарь: ядро с «{0}» её не связывает. Панель может включить её вместе с ним.', main);
+}
+
+function evPartWarn(e) {
+  const p = e.parent_name || '#' + e.parent;
+  if (e.part === 'core') return L('Это часть «{0}»: ядро включает её само в её время, но только пока идёт «{0}». Включить можно и отдельно — пойдёт свою обычную длину.', p);
+  if (e.part === 'script') return L('Это этап «{0}», его включает скрипт ядра. Ручное включение добавит существ и объекты этапа, но не логику скрипта.', p);
+  return L('Это часть «{0}», но у неё свой календарь: ядро их не связывает. Панель выключает её вместе с «{0}» и не пускает, пока «{0}» держат выключенным.', p);
+}
+
+/* ---------- карточка события */
+
+function evActionModal(e, mode, done) {
+  const on = mode === 'keep_on';
+  const fam = e.family || [];
+  const core = fam.filter((c) => c.part === 'core');
+  const during = fam.filter((c) => c.part === 'during' && c.ruled);
+  formModal({
+    title: on ? L('Держать включённым: {0}', e.name) : L('Держать выключенным: {0}', e.name),
+    text: on ? L('Панель раз в минуту проверяет, идёт ли событие, и включает его снова — в том числе после перезапуска мира. Срок пустой — пока не вернёте расписание.')
+      : L('Панель раз в минуту проверяет, не началось ли событие по расписанию, и выключает его. Срок пустой — пока не вернёте расписание.'),
+    fields: [{ name: 'until', label: L('До какого времени'), type: 'datetime-local', hint: L('Можно оставить пустым.') },
+      ...(on && core.length ? [evNote(L('Сами начнутся в своё время, пока идёт событие: {0}.', core.map((c) => `«${c.name}» — ${evPartTime(c)}`).join('; ')))] : []),
+      ...(on ? during.map((c) => ({ name: 'part_' + c.entry, type: 'checkbox', value: false, label: L('Держать включённым и «{0}»', c.name) })) : []),
+      ...(!on && fam.length ? [evNote(L('Части события панель тоже будет держать выключенными: {0}.', evNames(fam)))] : []),
+      ...(on && e.conflict_list.length ? [{ name: 'stop_conflicts', type: 'checkbox', value: true,
+        label: L('Остановить и держать выключенными мешающие события: {0}', e.conflict_list.map((c) => c.name).join(', ')) }] : []),
+      ...(on && evMain(e) ? [{ name: 'announce', label: L('Объявить игрокам в чат (пусто — без объявления)'), value: L('Начался праздник «{0}»!', e.name) }] : [])],
+    submit: on ? L('Держать включённым') : L('Держать выключенным'), danger: !on,
+    onSubmit: async (v) => (await api('/api/event', { entry: e.entry, action: mode, until: v.until ? Math.floor(new Date(v.until).getTime() / 1000) : null,
+      stop_conflicts: !!v.stop_conflicts, announce: v.announce || '', parts: during.filter((c) => v['part_' + c.entry]).map((c) => c.entry) })).data,
+    onDone: done,
+  });
+}
+
+/* «Включить/Выключить сейчас»: у события с расписанием это срок — панель держит его сама,
+   даже если мир перезапустится, а потом возвращает расписание */
+function evQuickModal(e, on, done) {
+  const fam = e.family || [];
+  const core = fam.filter((c) => c.part === 'core');
+  const during = fam.filter((c) => c.part === 'during' && c.ruled && !evOn(c));
+  const before = fam.filter((c) => c.part === 'before' && evOn(c));
+  const running = fam.filter(evOn);
+  const now = Date.now() / 1000;
+  const ruled = e.ruled !== false;
+  const cur = e.natural && e.current;
+  const text = on
+    ? (!ruled ? L('Событие начнётся сейчас. Своего расписания у него нет: оно идёт, пока его не выключат — вы или скрипт ядра.')
+      : cur ? L('Событие снова пойдёт — до конца срока по расписанию, {0}.', fmtDT(cur[1]))
+        : L('Событие пойдёт сейчас на свою обычную длину ({0}) — до {1}. Панель держит его весь срок, даже если мир перезапустится, а потом вернёт расписание.', evDur(e.length), fmtDT(now + e.length * 60)))
+    : (!ruled ? L('Событие закончится сейчас.')
+      : cur ? L('Событие выключится до конца своего срока по расписанию ({0}): панель не даст ему начаться снова. Потом всё пойдёт как обычно.', fmtDT(cur[1]))
+        : L('Событие закончится сейчас, дальше — по расписанию{0}.', e.next ? L(': ближайшее {0}', evRange(e.next)) : ''));
+  const fields = [];
+  if (on && core.length) fields.push(evNote(L('Сами начнутся в своё время, пока идёт событие: {0}.', core.map((c) => `«${c.name}» — ${evPartTime(c)}`).join('; '))));
+  if (on) for (const c of during) {
+    fields.push({ name: 'part_' + c.entry, type: 'checkbox', value: false,
+      label: L('Сразу включить и «{0}» (по календарю — {1})', c.name, c.next ? evRange(c.next) : evSchedule(c)) });
+  }
+  if (on && before.length) fields.push(evNote(L('Сейчас идёт подготовка — панель её выключит, раз событие уже начинается: {0}.', evNames(before))));
+  if (!on && running.length) fields.push({ name: 'with_parts', type: 'checkbox', value: true, label: L('Выключить и части, которые сейчас идут: {0}', evNames(running)) });
+  if (on && (e.conflict_list || []).some((c) => c.active)) {
+    fields.push({ name: 'stop_conflicts', type: 'checkbox', value: true,
+      label: L('Сначала остановить мешающие события: {0}', e.conflict_list.filter((c) => c.active).map((c) => c.name).join(', ')) });
+  }
+  if (on && evMain(e)) fields.push({ name: 'announce', label: L('Объявить игрокам в чат (пусто — без объявления)'), value: L('Начался праздник «{0}»!', e.name) });
+  formModal({
+    title: on ? L('Включить: {0}', e.name) : L('Выключить: {0}', e.name), text, fields,
+    submit: on ? L('Включить') : L('Выключить'), danger: !on,
+    onSubmit: async (v) => (await api('/api/event', { entry: e.entry, action: on ? 'start' : 'stop', stop_conflicts: !!v.stop_conflicts,
+      announce: v.announce || '', parts: during.filter((c) => v['part_' + c.entry]).map((c) => c.entry), with_parts: v.with_parts !== false })).data,
+    onDone: done,
+  });
+}
+
+/* ---------- где проходит: зоны по существам и объектам события, точки на карте мира */
+
+const evPlaceTitle = (p) => areaTitle(p.zone, p.zone_name) || (p.map in MAP_CONT ? MAP_CONT[p.map] : L('карта {0}', p.map));
+
+function placesMapModal({ title, label, places, focus, note }) {
+  const marks = places.flatMap((p) => p.points.map(([x, y, npc]) => ({ map: p.map, x, y, cls: npc ? 'npc' : 'obj',
+    title: `${label} · ${evPlaceTitle(p)} · ${npc ? L('существо') : L('объект')}` })));
+  const first = focus || places.find((p) => p.map in MAP_CONT);
+  const open = focus ? { map: focus.map, zoneArea: focus.zone, x: focus.points[0][0], y: focus.points[0][1] } : { map: first ? first.map : 1 };
+  const view = worldMapView({ marks, open, readonly: true, note });
+  let close;
+  const box = h('div', { class: 'drawer wm-drawer' },
+    h('div', { class: 'drawer-h' }, h('div', { class: 'grow' }, h('h2', null, title),
+      h('div', { class: 'sub' }, focus ? evPlaceTitle(focus) : L('{0} мест', places.length))),
+    h('button', { class: 'btn ghost sm x', type: 'button', 'aria-label': L('Закрыть'), onclick: () => close() }, icon('x'))),
+    h('div', { class: 'drawer-b' }, view.el));
+  close = openOverlay(box);
+}
+
+function eventMapModal(e, places, focus) {
+  placesMapModal({ title: L('Где проходит: {0}', e.name), label: e.name, places, focus,
+    note: L('Точки — где стоят существа (зелёные) и объекты (жёлтые) события. Другой материк — выше, в строке «Мир ›».') });
+}
+
+/* Места списком: зона, материк, сколько там, подзоны и «На карте»; больше шести — под «Ещё» */
+function placeRows(places, onMap) {
+  const row = (p) => h('div', { class: 'ev-place' },
+    h('div', { class: 'ev-place-h' },
+      h('b', null, evPlaceTitle(p)),
+      badge(p.map in MAP_CONT ? MAP_CONT[p.map] : L('подземелье или поле боя')),
+      h('span', { class: 'muted small grow' }, [p.creatures ? L('существ: {0}', fmtN(p.creatures)) : null,
+        p.objects ? L('объектов: {0}', fmtN(p.objects)) : null].filter(Boolean).join(' · ')),
+      p.map in MAP_CONT && p.points.length ? h('button', { class: 'btn sm ghost', type: 'button', onclick: () => onMap(p) },
+        icon('worldmap'), L('На карте')) : null),
+    p.areas.length ? h('div', { class: 'chips' }, p.areas.map((a) => h('span', { class: 'chip static' }, areaTitle(a.area, a.area_name)))) : null);
+  const top = places.slice(0, 6), rest = places.slice(6);
+  return [h('div', { class: 'ev-places' }, top.map(row)),
+    rest.length ? h('details', { class: 'ev-more' }, h('summary', null, L('Ещё {0} мест', rest.length)), h('div', { class: 'ev-places' }, rest.map(row))) : null];
+}
+
+function evPlacesCard(e, where) {
+  const body = h('div', { class: 'card-b' }, h('p', { class: 'muted small' }, L('Ищу, где стоят существа и объекты события…')));
+  const all = h('button', { class: 'btn sm', type: 'button', hidden: true }, icon('worldmap'), L('Все места на карте'));
+  const box = card(L('Где проходит'), null, all, body);
+  (async () => {
+    const places = (await api('/api/event/places?entry=' + e.entry)).data;
+    await mapsManifest().catch(() => null);                 // русские названия зон — из areas.json
+    if (!places.length) {
+      fill(body, h('p', { class: 'muted' }, e.schedule_type === 0
+        ? L('Своих существ и объектов в мире у события нет — всё делает скрипт ядра.')
+        : L('Своих существ и объектов в мире у события нет: оно меняет что-то другое — например, кто ждёт в подземелье.')));
+      return;
+    }
+    const names = places.slice(0, 3).map(evPlaceTitle);
+    fill(where, icon('worldmap'), h('span', null, names.join(', ') + (places.length > 3 ? L(' и ещё {0}', places.length - 3) : '')));
+    const onMap = places.some((p) => p.map in MAP_CONT && p.points.length);
+    all.hidden = !onMap;
+    all.onclick = () => eventMapModal(e, places);
+    fill(body, placeRows(places, (p) => eventMapModal(e, places, p)));
+  })().catch((err) => fill(body, h('p', { class: 'warn-text small' }, err.message)));
+  return box;
+}
+
+/* Карточка события. back — карточка, из которой сюда перешли (она остаётся открытой под этой):
+   «‹ Назад» закрывает эту и обновляет ту. Переходы дальше (часть, главное, существо) — так же. */
+function eventDrawer(entry, onChange, back) {
+  const box = h('div', { class: 'drawer ev-drawer', role: 'dialog', 'aria-modal': 'true' },
+    h('div', { class: 'drawer-b' }, h('div', { class: 'empty' }, L('Загружаю…'))));
+  let closing = false;
+  const close = openOverlay(box, back ? back.refresh : null);
+  const changed = () => { draw(); if (onChange) onChange(); };
+  const draw = async () => {
+    let e;
+    try { e = (await api('/api/event?entry=' + entry)).data; } catch (err) {
+      fill(box, drawerBox(L('Событие №{0}', entry), null, close, back), h('div', { class: 'drawer-b' }, errorCard(err)));
+      return;
+    }
+    const nav = { label: e.name, refresh: () => { if (!closing && box.isConnected) changed(); },
+      closeAll: () => { closing = true; if (back) back.closeAll(); close(); } };
+    const goEvent = (id) => eventDrawer(id, onChange, nav);
+    const goNpc = (id) => creatureDrawer(id, nav);
+    const now = Date.now() / 1000;
+    const [stText, stKind] = evStatus(e);
+    const cast = e.creatures.filter((c) => c.thumb).slice(0, 6);
+    const where = h('div', { class: 'ev-where' });
+    const placesCard = evPlacesCard(e, where);
+    const hero = h('div', { class: `ev-hero ev-t-${e.theme}` },
+      h('div', { class: 'ev-hero-ico' }, gicon(e.icon, 'xxl')),
+      h('div', { class: 'ev-hero-t' },
+        h('div', { class: 'row' }, badge(EV_CAT[e.cat] || e.cat), badge(stText, stKind)),
+        h('h3', null, e.name), e.name_en && e.name_en !== e.name ? h('div', { class: 'ev-en' }, e.name_en) : null,
+        e.about ? h('p', null, e.about) : null, where),
+      cast.length ? h('div', { class: 'ev-cast' }, cast.map((c) => h('figure', { class: 'click', title: c.sub ? `${c.name} <${c.sub}>` : c.name,
+        onclick: () => goNpc(c.entry) }, npcThumb(c.thumb, 'm'), h('figcaption', null, c.name)))) : null);
+
+    const cnt = e.counts || {};
+    const adds = [cnt.creatures ? L('существ: {0}', fmtN(cnt.creatures)) : null, cnt.objects ? L('объектов: {0}', fmtN(cnt.objects)) : null,
+      cnt.quests ? L('заданий: {0}', fmtN(cnt.quests)) : null, cnt.changes ? L('меняет внешность: {0}', fmtN(cnt.changes)) : null].filter(Boolean);
+    const removes = [cnt.creatures_off ? L('существ: {0}', fmtN(cnt.creatures_off)) : null, cnt.objects_off ? L('объектов: {0}', fmtN(cnt.objects_off)) : null].filter(Boolean);
+    const info = card(L('Расписание и что даёт'), null, null, h('div', { class: 'card-b' }, facts([
+      [L('Расписание'), evSchedule(e)],
+      [L('Сейчас'), e.current ? `${L('идёт по расписанию')}: ${evRange(e.current)} · ${evLeft(e.current[1] - now)}` : L('по расписанию не идёт')],
+      [L('Ближайшие'), e.upcoming.length ? h('div', { class: 'ev-dates' }, e.upcoming.filter((w) => w[1] > now).slice(0, 6).map((w) =>
+        h('span', { class: 'chip static' }, evRange(w)))) : L('по расписанию не будет')],
+      [L('Добавляет в мир'), adds.length ? adds.join(', ') : '—'],
+      removes.length ? [L('Убирает из мира'), removes.join(', ')] : null,
+      e.parent_name ? [L('Часть события'), h('a', { href: '#', onclick: (ev) => { ev.preventDefault(); goEvent(e.parent); } }, e.parent_name)] : null,
+    ].filter(Boolean))));
+
+    const warns = [];
+    if (e.schedule_type === 0 && !e.parent) warns.push(L('Это событие ведёт скрипт ядра. Ручной запуск добавит его существ и объекты, но не саму логику (нападения, этапы).'));
+    if (e.parent) warns.push(evPartWarn(e));
+    for (const c of e.conflict_list) {
+      warns.push(L('Делит существ и объекты с «{0}» ({1} шт.): если идут оба, то, что закончится первым, уберёт и общее.', c.name, fmtN(c.n))
+        + (c.active ? L(' Оно сейчас идёт.') : ''));
+    }
+    const f = e.force;
+    const world = e.active != null;
+    const ctrl = card(L('Управление'), world ? null : L('мир не запущен'), null, h('div', { class: 'card-b stack tight' },
+      warns.map((w) => h('div', { class: 'alert warning' }, icon('warn'), h('span', null, w))),
+      h('div', { class: 'row' },
+        world ? h('button', { class: 'btn pri', type: 'button', disabled: evOn(e) || null, onclick: () => evQuickModal(e, true, changed) }, icon('play'), L('Включить сейчас')) : null,
+        world ? h('button', { class: 'btn dng', type: 'button', disabled: !evOn(e) || null, onclick: () => evQuickModal(e, false, changed) }, icon('pause'), L('Выключить сейчас')) : null,
+        h('button', { class: 'btn', type: 'button', onclick: () => evActionModal(e, 'keep_on', changed) }, L('Держать включённым…')),
+        h('button', { class: 'btn', type: 'button', onclick: () => evActionModal(e, 'keep_off', changed) }, L('Держать выключенным…')),
+        f ? h('button', { class: 'btn', type: 'button', onclick: () => formModal({ title: L('Вернуть расписание: {0}', e.name),
+          text: L('Панель перестанет держать событие и приведёт его к расписанию ядра.'), submit: L('Вернуть'),
+          onSubmit: async () => (await api('/api/event', { entry: e.entry, action: 'auto' })).data, onDone: changed }) }, icon('refresh'), L('Вернуть расписание')) : null),
+      e.guard ? h('p', { class: 'muted small' }, L('Время этого события панель возвращает к расписанию: его включали или выключали вручную, и ядро до перезапуска мира сдвинуло своё время. На ближайшей границе по расписанию панель всё поправит.')) : null,
+      h('p', { class: 'muted small' }, world
+        ? L('«Включить» и «Выключить» действуют на срок: событие идёт свою обычную длину или стоит до конца своего окна по расписанию — даже если мир перезапустится. Потом панель возвращает расписание. «Держать…» — до выбранного срока или пока не вернёте сами.')
+        : L('Мир не запущен: «Держать…» панель применит, как только он поднимется.'))));
+
+    const fam = e.family.length ? card(L('Части события'), L('{0} шт.', e.family.length), null, h('div', { class: 'card-b stack tight' },
+      h('p', { class: 'muted small' }, L('Выключаете главное — панель выключает и идущие части. Включаете — части с пометкой «ядро включает само» начнутся в своё время, остальные можно включить сразу.')),
+      h('div', { class: 'ev-parts' }, e.family.map((c) => {
+        const [pt, pk] = EV_PART[c.part] || [c.part, null];
+        return h('div', { class: `ev-part ev-t-${c.theme}` },
+          gicon(c.icon, 'm'),
+          h('div', { class: 'ev-part-t' },
+            h('div', { class: 'ev-part-n' },
+              h('a', { href: '#', onclick: (ev) => { ev.preventDefault(); goEvent(c.entry); } }, c.name), badge(pt, pk), evBadge(c)),
+            h('small', { class: 'muted' }, evPartTime(c)),
+            h('small', null, evPartNote(c, e.name))),
+          world ? h('button', { class: 'btn sm', type: 'button', onclick: () => evQuickModal(c, !evOn(c), changed) },
+            icon(evOn(c) ? 'pause' : 'play'), evOn(c) ? L('Выключить') : L('Включить')) : null);
+      })))) : null;
+    const quests = e.quests.length ? card(L('Задания события'), L('{0} · щёлкните — карточка задания', fmtN(e.quests.length)), null,
+      h('div', { class: 'list scroll-box' }, e.quests.map((q) =>
+        h('div', { class: 'li click', onclick: () => questDrawer(q.entry, nav) }, gicon('inv_misc_note_01', 's'), h('span', { class: 'grow' }, q.title),
+          h('span', { class: 'muted small' }, L('с {0} ур.', q.min_level || 1)))))) : null;
+    const npcs = e.creatures.length ? card(L('Кто появляется'), L('щёлкните — карточка существа'), null, h('div', { class: 'ev-npcs' }, e.creatures.map((c) =>
+      h('button', { class: 'ev-npc click', type: 'button', onclick: () => goNpc(c.entry) }, npcThumb(c.thumb, 's'),
+        h('span', { class: 'grow' }, h('b', null, c.name), c.sub ? h('span', { class: 'muted' }, ` <${c.sub}>`) : null),
+        c.n > 1 ? h('span', { class: 'muted small' }, '×' + c.n) : null)))) : null;
+    const core = e.core ? card(L('Что говорит ядро'), `.event ${e.entry}`, null, h('pre', { class: 'out ev-core' }, e.core)) : null;
+    [[placesCard, 'ev-places'], [info, 'ev-info'], [ctrl, 'ev-ctrl'], [fam, 'ev-parts'], [npcs, 'ev-npcs'], [quests, 'ev-quests'], [core, 'ev-core']]
+      .forEach(([c, k]) => foldCard(c, k));
+    fill(box, drawerBox(e.name, L('событие №{0}', e.entry), close, back), h('div', { class: 'drawer-b' }, hero,
+      h('div', { class: 'grid g2 ev-cols' }, h('div', { class: 'stack' }, placesCard, info, ctrl, fam), h('div', { class: 'stack' }, npcs, quests, core))));
+  };
+  draw();
+}
+
+/* ---------- карточка задания: что надо сделать, что дадут, кто выдаёт и принимает, что до и что после */
+
+const QUEST_HOW = { done: L('сначала сдать'), active: L('сначала взять'), chain: L('предложат сразу после'), opens: L('откроется после') };
+
+function questDrawer(entry, back) {
+  const box = h('div', { class: 'drawer cr-drawer', role: 'dialog', 'aria-modal': 'true' },
+    h('div', { class: 'drawer-b' }, h('div', { class: 'empty' }, L('Загружаю…'))));
+  let closing = false;
+  const close = openOverlay(box, back ? back.refresh : null);
+  (async () => {
+    let d;
+    try {
+      [d] = await Promise.all([api('/api/quest?entry=' + entry).then((r) => r.data),
+        questMeta ? null : api('/api/quest/meta').then((r) => { questMeta = r.data; }).catch(() => null)]);
+    } catch (err) {
+      fill(box, drawerBox(L('Задание №{0}', entry), null, close, back), h('div', { class: 'drawer-b' }, errorCard(err)));
+      return;
+    }
+    const nav = { label: d.title, refresh: () => {}, closeAll: () => { closing = true; if (back) back.closeAll(); close(); } };
+    const goQuest = (id) => questDrawer(id, nav);
+    const goNpc = (id) => creatureDrawer(id, nav);
+    const npcRow = (n, extra) => h('div', { class: 'li click', onclick: () => goNpc(n.entry) }, npcThumb(n.thumb, 's'),
+      h('span', { class: 'grow' }, h('b', null, n.name), n.subname ? h('span', { class: 'muted' }, ` <${n.subname}>`) : null), extra || null);
+    const qRow = (q, note) => h('div', { class: 'li click', onclick: () => goQuest(q.entry) }, gicon('inv_misc_note_01', 's'),
+      h('span', { class: 'grow' }, q.title), note ? badge(note, 'acc') : null, h('span', { class: 'muted small' }, L('ур. {0}', q.level > 0 ? q.level : q.min_level)));
+    const lv = d.level;
+    const head = h('div', { class: 'cr-hero' }, gicon('inv_misc_note_01', 'xl'),
+      h('div', { class: 'grow stack tight' }, h('h3', null, d.title),
+        h('div', { class: 'row' }, badge(L('ур. {0}', lv.quest > 0 ? lv.quest : lv.min), 'acc'), lv.min ? badge(L('взять с {0} ур.', lv.min)) : null,
+          d.repeatable ? badge(L('можно повторять'), 'ok') : null, d.time_limit ? badge(L('на время: {0}', evDur(Math.round(d.time_limit / 60))), 'warn') : null,
+          d.suggested > 1 ? badge(L('группа из {0}', d.suggested), 'warn') : null,
+          ...d.events.map((ev) => h('button', { class: 'badge click ev-badge', type: 'button', onclick: () => eventDrawer(ev.entry, null, nav) }, L('событие «{0}»', ev.name))))));
+    const goals = [];
+    for (const k of d.kill) {
+      goals.push(h('div', { class: 'li click', onclick: () => goNpc(k.creature.entry) }, npcThumb(k.creature.thumb, 's'),
+        h('span', { class: 'grow' }, L('Убить: {0}', k.creature.name || '#' + k.creature.entry)), badge('×' + k.count)));
+    }
+    for (const c of d.collect) {
+      goals.push(h('div', { class: 'li' }, itemChip(c.item, c.count > 1 ? h('span', { class: 'muted' }, '×' + c.count) : null),
+        c.drop && c.drop.creature ? h('a', { href: '#', class: 'small', onclick: (ev) => { ev.preventDefault(); goNpc(c.drop.creature.entry); } },
+          L('падает с «{0}»', c.drop.creature.name)) : null));
+    }
+    if (d.src_item && d.src_item.item) goals.push(h('div', { class: 'li' }, h('span', { class: 'muted small' }, L('Выдают с собой:')), itemChip(d.src_item.item)));
+    if (d.trigger) goals.push(h('div', { class: 'li' }, h('span', null, L('Дойти до места (область №{0})', d.trigger))));
+    if (d.req_money) goals.push(h('div', { class: 'li' }, h('span', { class: 'grow' }, L('Принести денег:')), coins(d.req_money)));
+    const r = d.rewards;
+    const rewItems = r.items.filter((x) => x.item), choice = r.choice.filter((x) => x.item);
+    const reward = card(L('Награда'), null, null, h('div', { class: 'card-b stack tight' },
+      choice.length ? h('div', null, h('div', { class: 'small muted' }, L('На выбор одно из:')),
+        h('div', { class: 'reward-grid' }, choice.map((x) => itemChip(x.item, x.count > 1 ? h('span', { class: 'muted' }, '×' + x.count) : null)))) : null,
+      rewItems.length ? h('div', null, h('div', { class: 'small muted' }, L('Дадут всё это:')),
+        h('div', { class: 'reward-grid' }, rewItems.map((x) => itemChip(x.item, x.count > 1 ? h('span', { class: 'muted' }, '×' + x.count) : null)))) : null,
+      facts([r.money ? [L('Деньги'), coins(r.money)] : null, r.xp ? [L('Опыт'), L('до {0}', fmtN(r.xp))] : null,
+        ...r.rep.map((x) => [L('Репутация'), `${d.faction_names[x.faction] || '#' + x.faction} ${x.value > 0 ? '+' : ''}${x.value}`]),
+        r.spell ? [L('Заклинание'), `№${r.spell}`] : null].filter(Boolean)),
+      !choice.length && !rewItems.length && !r.money && !r.xp && !r.rep.length ? h('p', { class: 'muted' }, L('Награды нет.')) : null));
+    const who = card(L('Кто выдаёт и принимает'), null, null, h('div', { class: 'card-b stack tight' },
+      h('div', { class: 'small muted' }, L('Выдаёт')),
+      d.givers.length || d.item_givers.length || d.obj_givers.length ? h('div', { class: 'list' },
+        d.givers.map((n) => npcRow(n)), d.item_givers.map((it) => h('div', { class: 'li' }, itemChip(it), h('span', { class: 'muted small' }, L('начинает задание')))),
+        d.obj_givers.map((o) => h('div', { class: 'li' }, gicon('inv_misc_note_02', 's'), h('span', { class: 'grow' }, o.name), h('span', { class: 'muted small' }, L('предмет в мире'))))) : h('p', { class: 'muted small' }, '—'),
+      h('div', { class: 'small muted' }, L('Принимает')),
+      d.enders.length || d.obj_enders.length ? h('div', { class: 'list' }, d.enders.map((n) => npcRow(n)),
+        d.obj_enders.map((o) => h('div', { class: 'li' }, gicon('inv_misc_note_02', 's'), h('span', { class: 'grow' }, o.name), h('span', { class: 'muted small' }, L('предмет в мире'))))) : h('p', { class: 'muted small' }, '—')));
+    const ch = d.chain;
+    const chain = ch.before.length || ch.after.length || ch.exclusive.length ? card(L('Цепочка заданий'), null, null, h('div', { class: 'card-b stack tight' },
+      ch.before.length ? [h('div', { class: 'small muted' }, L('Чтобы его взять')), h('div', { class: 'list' }, ch.before.map((q) => qRow(q, QUEST_HOW[q.how])))] : null,
+      ch.after.length ? [h('div', { class: 'small muted' }, L('После него')), h('div', { class: 'list' }, ch.after.map((q) => qRow(q, QUEST_HOW[q.how])))] : null,
+      ch.exclusive.length ? [h('div', { class: 'small muted' }, L('Можно сделать только одно из них и это')), h('div', { class: 'list' }, ch.exclusive.map((q) => qRow(q)))] : null))
+      : card(L('Цепочка заданий'), null, null, h('div', { class: 'card-b' }, h('p', { class: 'muted' }, L('Задание само по себе: до него ничего не нужно, после него ничего не открывается.'))));
+    const goalCard = card(L('Что сделать'), null, null, h('div', { class: 'card-b stack tight' },
+      d.objectives ? h('div', { class: 'qtext' }, wowText(d.objectives)) : null,
+      goals.length ? h('div', { class: 'list' }, goals) : h('p', { class: 'muted small' }, L('Поговорить с тем, кто принимает задание.'))));
+    const story = d.details || d.objectives ? card(L('Как в игре'), L('текст задания'), null, h('div', { class: 'card-b' }, questPreview(d))) : null;
+    [[goalCard, 'q-goal'], [reward, 'q-reward'], [who, 'q-who'], [chain, 'q-chain'], [story, 'q-story']].forEach(([c, k]) => foldCard(c, k));
+    fill(box, drawerBox(d.title, L('задание №{0}', d.entry), () => { if (!closing) close(); }, back), h('div', { class: 'drawer-b' }, head,
+      h('div', { class: 'grid g2 ev-cols' }, h('div', { class: 'stack' }, goalCard, reward, chain), h('div', { class: 'stack' }, who, story))));
+  })();
+}
+
+/* ---------- карточка существа: что это, в каких событиях, какие задания даёт, где стоит */
+
+const REACTION = { hostile: [L('враждебен'), 'bad'], friendly: [L('дружелюбен'), 'ok'], neutral: [L('нейтрален'), 'warn'] };
+
+function creatureDrawer(entry, back) {
+  const box = h('div', { class: 'drawer cr-drawer', role: 'dialog', 'aria-modal': 'true' },
+    h('div', { class: 'drawer-b' }, h('div', { class: 'empty' }, L('Загружаю…'))));
+  let closing = false;
+  const close = openOverlay(box, back ? back.refresh : null);
+  (async () => {
+    let c;
+    try { c = (await api('/api/creature?entry=' + entry)).data; } catch (err) {
+      fill(box, drawerBox(L('Существо №{0}', entry), null, close, back), h('div', { class: 'drawer-b' }, errorCard(err)));
+      return;
+    }
+    await mapsManifest().catch(() => null);
+    const nav = { label: c.name, refresh: () => {}, closeAll: () => { closing = true; if (back) back.closeAll(); close(); } };
+    const opt = (list, v) => (list.find(([k]) => k === v) || [v, String(v)])[1];
+    const lvl = c.minlevel === c.maxlevel ? String(c.minlevel) : `${c.minlevel}–${c.maxlevel}`;
+    const hp = c.health && c.health[0] != null
+      ? (c.health[1] == null || c.health[0] === c.health[1] ? fmtN(c.health[0]) : `${fmtN(c.health[0])}–${fmtN(c.health[1])}`) : null;
+    const react = (k) => { const [t, kind] = REACTION[k] || ['—', null]; return badge(t, kind); };
+    const roles = c.roles.map((r) => Lsrv(r));
+    const hero = h('div', { class: 'cr-hero' }, npcThumb(c.thumb, 'l'),
+      h('div', { class: 'grow stack tight' },
+        h('h3', null, c.name, c.subname ? h('span', { class: 'muted' }, ` <${c.subname}>`) : null),
+        h('div', { class: 'row' }, badge(L('ур. {0}', lvl), 'acc'), c.rank ? badge(opt(NPC_RANKS, c.rank), 'warn') : null,
+          badge(opt(NPC_TYPES, c.type)), ...roles.map((r) => badge(r, 'ok'))),
+        h('div', { class: 'row small cr-react' }, h('span', { class: 'muted' }, L('Альянсу:')), react(c.faction.alliance),
+          h('span', { class: 'muted' }, L('Орде:')), react(c.faction.horde))));
+    const stats = card(L('Характеристики'), null, null, h('div', { class: 'card-b' }, facts([
+      [L('Уровень'), lvl],
+      [L('Здоровье'), hp || L('×{0} к обычному для уровня', c.health_mult)],
+      [L('Тип'), opt(NPC_TYPES, c.type)], [L('Ранг'), opt(NPC_RANKS, c.rank)], [L('Класс'), opt(NPC_CLASSES, c.unitclass)],
+      [L('Фракция'), `${c.faction.name || '—'} (№${c.faction.id})`],
+      [L('Кто это'), roles.length ? roles.join(', ') : c.civilian ? L('мирный житель') : L('обычное существо')],
+      [L('Добыча'), c.loot ? L('есть') : L('нет')],
+      [L('В мире'), c.spawns ? L('{0} шт.', fmtN(c.spawns)) : L('нигде не стоит — его вызывает скрипт или событие')],
+    ])));
+    const events = c.events.length ? card(L('В событиях'), null, null, h('div', { class: 'list' }, c.events.map((ev) =>
+      h('div', { class: 'li click', onclick: () => eventDrawer(ev.entry, null, nav) }, evIcon(ev, 's'), h('span', { class: 'grow' }, ev.name),
+        h('span', { class: 'muted small' }, ev.off ? L('на время события убирают: {0}', fmtN(ev.n)) : L('появляется: {0}', fmtN(ev.n))))))) : null;
+    const quests = c.quests.length ? card(L('Задания'), fmtN(c.quests.length), null, h('div', { class: 'list scroll-box' }, c.quests.map((q) =>
+      h('div', { class: 'li click', onclick: () => questDrawer(q.entry, nav) }, gicon('inv_misc_note_01', 's'),
+        h('span', { class: 'grow' }, q.title, q.event_name ? h('a', { href: '#', class: 'small cr-qev', onclick: (ev) => { ev.preventDefault(); ev.stopPropagation(); eventDrawer(q.event, null, nav); } },
+          ' · ' + L('только в «{0}»', q.event_name)) : null),
+        q.gives ? badge(L('даёт'), 'ok') : null, q.takes ? badge(L('принимает'), 'acc') : null,
+        h('span', { class: 'muted small' }, L('с {0} ур.', q.min_level || 1)))))) : null;
+    const onMap = c.places.some((p) => p.map in MAP_CONT && p.points.length);
+    const mapOf = (focus) => placesMapModal({ title: L('Где стоит: {0}', c.name), label: c.name, places: c.places, focus,
+      note: L('Зелёные точки — где стоит это существо. Другой материк — выше, в строке «Мир ›».') });
+    const where = card(L('Где стоит'), c.spawns ? L('{0} мест', fmtN(c.spawns)) : null,
+      onMap ? h('button', { class: 'btn sm', type: 'button', onclick: () => mapOf(null) }, icon('worldmap'), L('Все места на карте')) : null,
+      h('div', { class: 'card-b' }, c.places.length ? placeRows(c.places, mapOf)
+        : h('p', { class: 'muted' }, L('В мире его нет: появляется по скрипту, в событии или в подземелье по вызову.'))));
+    [[stats, 'cr-stats'], [events, 'cr-events'], [quests, 'cr-quests'], [where, 'cr-places']].forEach(([k, key]) => foldCard(k, key));
+    fill(box, drawerBox(c.name, L('существо №{0}', c.entry), () => { if (!closing) close(); }, back), h('div', { class: 'drawer-b' }, hero,
+      h('div', { class: 'grid g2 ev-cols' }, h('div', { class: 'stack' }, stats, events), h('div', { class: 'stack' }, where, quests))));
+  })();
+}
+
+PAGES.events = {
+  title: L('События и праздники'), sub: L('Календарь праздников, ярмарок и событий мира. Любое можно включить или выключить вручную.'),
+  async render(el) {
+    const today = new Date();
+    const st = { year: today.getFullYear(), month: today.getMonth(), view: pref.get('ev-view', 'month'), data: null,
+      cats: new Set((pref.get('ev-cats', 'holiday,fair,pvp,world')).split(',').filter(Boolean)) };
+    const box = h('div', { class: 'stack' });
+    const open = (entry) => eventDrawer(entry, () => load().catch(() => {}));
+    const load = async () => {
+      st.data = (await api('/api/events?year=' + st.year)).data;
+      draw();
+    };
+    // со «включить» у события с конфликтами — сразу в карточку: там видно, с чем оно спорит
+    const quick = async (e, on) => {
+      if (on && e.conflicts.length) { open(e.entry); return; }
+      let full = e;
+      if (e.children.length) {
+        try { full = (await api('/api/event?entry=' + e.entry)).data; } catch (err) { toast(err.message, true); return; }
+      }
+      evQuickModal(full, on, () => load().catch(() => {}));
+    };
+    const move = (dm) => {
+      const d = new Date(st.year, st.month + dm, 1);
+      const yearChanged = d.getFullYear() !== st.year;
+      st.year = d.getFullYear(); st.month = d.getMonth();
+      if (yearChanged) load().catch((err) => toast(err.message, true)); else draw();
+    };
+    const draw = () => {
+      const d = st.data, now = d.now;
+      const all = d.events;
+      const shown = all.filter((e) => st.cats.has(e.cat) && (st.cats.has('service') || !e.parent));
+      const nowList = all.filter((e) => evMain(e) && evOn(e));
+      const soon = all.filter((e) => evMain(e) && !evOn(e) && e.next && e.next[0] - now < 120 * DAY && e.cat !== 'world' && e.occurence >= 10080)
+        .sort((a, b) => a.next[0] - b.next[0]).slice(0, 6);
+      const nextHoliday = all.filter((e) => e.cat === 'holiday' && e.next).sort((a, b) => a.next[0] - b.next[0])[0];
+      const strip = card(L('Сейчас идёт'), d.world ? null : L('мир не запущен — по расписанию'), null, h('div', { class: 'card-b' },
+        nowList.length ? h('div', { class: 'ev-nows' }, nowList.map((e) => evNowCard(e, now, open)))
+          : h('p', { class: 'muted' }, L('Сейчас ни праздников, ни ярмарок.'), nextHoliday ? ' ' + L('Ближайший праздник — «{0}», {1}.', nextHoliday.name, evIn(nextHoliday.next[0] - now)) : '')));
+      const soonCard = soon.length ? card(L('Скоро'), L('ближайшие 120 дней'), null, h('div', { class: 'list' }, soon.map((e) =>
+        h('div', { class: 'li click ev-soon', onclick: () => open(e.entry) }, evIcon(e, 'm'),
+          h('span', { class: 'grow' }, h('b', null, e.name), h('span', { class: 'muted small' }, evRange(e.next))),
+          badge(evIn(e.next[0] - now), 'acc'))))) : null;
+
+      const views = seg([['month', L('Месяц')], ['year', L('Год')], ['list', L('Все события')]], st.view, (k) => { st.view = k; pref.set('ev-view', k); draw(); });
+      const chips = h('div', { class: 'chips' }, EV_CATS.filter(([c]) => all.some((e) => e.cat === c)).map(([c, title]) =>
+        h('button', { class: 'chip' + (st.cats.has(c) ? ' on' : ''), type: 'button', onclick: () => {
+          if (st.cats.has(c)) st.cats.delete(c); else st.cats.add(c);
+          pref.set('ev-cats', [...st.cats].join(',')); draw();
+        } }, title)));
+      const monthName = new Date(st.year, st.month, 1).toLocaleDateString(LOCALE, { month: 'long', year: 'numeric' });
+      const nav = st.view === 'list' ? null : h('div', { class: 'row ev-nav' },
+        h('button', { class: 'btn sm', type: 'button', 'aria-label': L('Назад'), onclick: () => move(st.view === 'year' ? -12 : -1) }, '‹'),
+        monthButton(st.view === 'year' ? String(st.year) : monthName, (el) => monthPicker(el, { year: st.year, month: st.month, yearsOnly: st.view === 'year' },
+          (y, m) => { const yc = y !== st.year; st.year = y; if (m != null) st.month = m; if (yc) load().catch((err) => toast(err.message, true)); else draw(); }), 'ev-period'),
+        h('button', { class: 'btn sm', type: 'button', 'aria-label': L('Вперёд'), onclick: () => move(st.view === 'year' ? 12 : 1) }, '›'),
+        h('button', { class: 'btn sm ghost', type: 'button', onclick: () => { const yc = today.getFullYear() !== st.year; st.year = today.getFullYear(); st.month = today.getMonth(); if (yc) load(); else draw(); } }, L('Сегодня')));
+      const body = st.view === 'list' ? evListView(shown, open, quick, now)
+        : st.view === 'year' ? evYearView(st, shown, open, now) : evMonthView(st, shown, open);
+      const calCard = card(null, null, null, h('div', { class: 'card-b stack tight' }, h('div', { class: 'row' }, views, nav, h('span', { class: 'spacer' }), chips), body));
+      fill(box, d.world ? null : h('div', { class: 'alert warning' }, icon('warn'), h('span', null, L('Мир не запущен: показываю расписание. Включать и выключать события можно, когда он работает.'))),
+        h('div', { class: 'grid ev-top' }, strip, soonCard), calCard);
+    };
+    setTools(refreshBtn(() => load().catch((e) => toast(e.message, true))));
+    el.replaceChildren(box);
+    await load();
+    every(120000, () => load().catch(() => {}));
   },
 };
 

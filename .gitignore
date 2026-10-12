@@ -11,5 +11,6 @@ venv/
 static/fonts/
 static/music/
 static/wow/maps/*.webp
+static/wow/minimap/
 static/wow/renders/
 static/wow/bg-*.jpg

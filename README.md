@@ -13,7 +13,17 @@ server without the console and without SQL.
   money, level, kick, mute, revive, repair, rename on next login, reset talents / spells / stats, restore a
   deleted character, remove and give back a single item.
 - **World map** — world → continent → zone → click a spot (or type coordinates) and teleport a character
-  there, online or offline. The ground height is taken from the server's own map files.
+  there, online or offline. The ground height is taken from the server's own map files. Zoom with the mouse
+  wheel towards the cursor, drag to move, pinch on a phone; zooming into a zone opens its map, zooming out
+  goes back to the continent. **Top-down view** like on wow.tools — the continents built from the minimaps of
+  your game client, zoomable down to single trees.
+- **Events and holidays** — a calendar of all `game_event` events (month, year, all events as tiles):
+  holidays, Darkmoon Faire, battleground weekends, invasions. Each event has its own themed card: when it runs
+  next, where it takes place (zones on the world map), who appears, its quests, and its parts (for example the
+  Wickerman bonfire of Hallow's End). Turn any event on or off now, or keep it on/off until a date; conflicting
+  events are shown. Click a creature for its card (level, health, faction and how it treats Alliance and Horde,
+  events, quests, where it stands) and a quest for its card (what to do, rewards, who gives and takes it, which
+  quest comes before and which after).
 - **Items** — create your own items: stats, resistances, "on equip" spells, any look from the game.
 - **Custom NPCs** — your own NPCs and mobs based on any creature look: name, level, faction, rank, size,
   pose, weapons, dialog window text, lines they say when they see a player, aggro or die. Place them with a
@@ -363,7 +373,9 @@ cd C:\wow-vanilla-AdminPanel
 py tools\build_assets.py "C:\Games\World of Warcraft"
 ```
 
-It writes `static\fonts\` (2 fonts), `static\music\` (13 tracks, ~19 MB) and `static\wow\maps\` (49 maps, ~6 MB).
+It writes `static\fonts\` (2 fonts), `static\music\` (13 tracks, ~19 MB), `static\wow\maps\` (49 maps, ~6 MB)
+and `static\wow\minimap\` (the top-down view: ~1900 tiles from the client minimaps, ~10 MB, 1–2 minutes).
+Only some of them: `--only fonts,music`, `--only maps`, `--only minimap`.
 
 4. Copy them to the server:
 
@@ -372,7 +384,7 @@ ssh you@your-server "mkdir -p /tmp/wow-assets"
 ```
 
 ```powershell
-scp -r static\fonts static\music static\wow\maps you@your-server:/tmp/wow-assets/
+scp -r static\fonts static\music static\wow\maps static\wow\minimap you@your-server:/tmp/wow-assets/
 ```
 
 5. On the server:
@@ -383,6 +395,10 @@ sudo cp -r /tmp/wow-assets/fonts /tmp/wow-assets/music /opt/wow-panel/static/
 
 ```bash
 sudo cp /tmp/wow-assets/maps/*.webp /opt/wow-panel/static/wow/maps/
+```
+
+```bash
+sudo rm -rf /opt/wow-panel/static/wow/minimap && sudo cp -r /tmp/wow-assets/minimap /opt/wow-panel/static/wow/
 ```
 
 ```bash
@@ -449,7 +465,7 @@ databases, so that user needs rights on each of them (the core's own user has th
 
 | File | What |
 |---|---|
-| `panel.db` | SQLite: online history, audit log, restart schedule, removed items, notes about custom NPCs/quests |
+| `panel.db` | SQLite: online history, audit log, restart schedule, removed items, notes about custom NPCs/quests, events the panel holds on or off |
 | `custom_items.sql`, `custom_npcs.sql`, `custom_quests.sql` | Copies of everything you created — see [How it works](#how-it-works) |
 | `GeoLite2-Country.mmdb` | Optional, step 12 |
 
@@ -516,6 +532,18 @@ mysql -u mangos -p classicmangos < /opt/wow-panel/data/custom_items.sql
   `panel_tp` in `game_tele`, moves it to the chosen spot, runs `reload game_tele` and `tele name`.
   (The core prints "game_tele reloaded" in the chat of everyone in game.) The ground height comes from the server's
   `maps/*.map` files; inside buildings and caves the height of the nearest NPC is used.
+- **Events.** The panel calculates the schedule of every event exactly like the core does
+  (`GameEventMgr::ComputeEventStartAndEndTime`, the moon phases of the Lunar Festival, Easter for Noblegarden,
+  the Darkmoon Faire Mondays) and asks the core which events are running (`event list`). **Turn on now** /
+  **Turn off now** use `event start` / `event stop`, but the core counts the event's time from that minute and
+  forgets manual changes on a restart or its weekly recalculation — so the panel holds the event itself for its
+  usual length (or until the end of its scheduled window), checks it every minute, and afterwards gives one more
+  command exactly at a boundary of the schedule, which puts the core's timing back as it was. **Keep on / off
+  until …** is the same without the automatic end. Parts of an event: the core starts the parts linked with
+  `linkedTo` itself, only while the main event runs, but does not stop them with it — the panel turns off the
+  running parts when you turn the main event off; parts with their own calendar (Winter Veil gifts, Darkmoon
+  Faire building stages, fishing contest announcements) can be turned on together with it. Holds and the
+  returning of the timing live in `panel.db`.
 - **Icons** of items, spells, races and classes are loaded by your browser from Wowhead's image server
   `wow.zamimg.com` — the only outside address the page may use.
 
@@ -562,8 +590,8 @@ text is the translation key. Dictionaries: `static/i18n/<code>.js`. Messages of 
 translated in the browser with the same dictionaries. The language follows the browser, or the choice on
 the **Settings** page.
 
-> **Note:** the newest sections — **World map, Custom NPCs, Custom quests** — are not translated yet and show
-> Russian text in other languages. Contributions are welcome.
+> **Note:** the newest sections — **World map, Events, Custom NPCs, Custom quests** — are not translated yet and
+> show Russian text in other languages. Contributions are welcome.
 
 ```bash
 python3 tools/i18n.py check
@@ -581,8 +609,10 @@ Missing translation = the Russian text is shown, nothing breaks. Code comments a
 panel.py               the whole server side (aiohttp): settings, API, SOAP, database, DBC and map readers
 static/                the page: index.html, boot.js, app.js, app.css, i18n/<lang>.js
 static/wow/maps/       maps.json and areas.json (zone bounds and names); *.webp from tools/build_assets.py
-tools/build_assets.py  fonts, music and map pictures from your own game client
+static/wow/minimap/    top-down view tiles and minimap.json (built by tools/build_assets.py, not in the repository)
+tools/build_assets.py  fonts, music, map pictures and top-down view from your own game client
 tools/build_maps.py    the map part of it (also rebuilds maps.json / areas.json with --json)
+tools/build_minimap.py the top-down view part of it (minimap tiles)
 tools/mpq.py           a small reader of the client's MPQ archives
 tools/passwd.py        sets the panel password in .env
 tools/i18n.py          translation checker

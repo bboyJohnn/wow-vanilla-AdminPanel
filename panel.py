@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import mimetypes
 import mmap
 import os
@@ -44,7 +45,7 @@ import struct
 import sys
 import time
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from xml.etree import ElementTree
@@ -686,8 +687,13 @@ def init_panel_db():
             CREATE TABLE IF NOT EXISTS custom_changes (kind TEXT, id INTEGER, ts INTEGER, PRIMARY KEY (kind, id));
             CREATE TABLE IF NOT EXISTS npc_flag_patch (entry INTEGER PRIMARY KEY, original INTEGER, ts INTEGER);
             CREATE TABLE IF NOT EXISTS quest_loot (quest INTEGER, loot INTEGER, item INTEGER, chance REAL, creature INTEGER);
+            CREATE TABLE IF NOT EXISTS event_force (entry INTEGER PRIMARY KEY, mode TEXT, until INTEGER, ts INTEGER);
+            CREATE TABLE IF NOT EXISTS event_guard (entry INTEGER PRIMARY KEY, pid INTEGER, ts INTEGER);
             DELETE FROM schedule WHERE kind <> 'restart';
         ''')
+        # run — «Включить/Выключить сейчас» (на срок), keep — «Держать…»
+        if 'kind' not in {r[1] for r in conn.execute('PRAGMA table_info(event_force)')}:
+            conn.execute("ALTER TABLE event_force ADD COLUMN kind TEXT DEFAULT 'keep'")
     os.chmod(PANEL_DB, 0o600)
 
 
@@ -906,11 +912,12 @@ AREAS = {}
 
 AREA_PARENT = {}                # подзона → зона (Круговзор → Зимние Ключи)
 AREA_BY_FLAG = {}               # в .map-файлах ядра записан флаг исследования зоны, а не её номер
+MAP_AREA = {}                   # карта подземелья или поля боя → его главная зона
 
 
 def load_areas():
     """Названия зон берём из AreaTable.dbc клиента: в мировой базе их нет."""
-    names = {}
+    names, tops = {}, {}
     try:
         raw = (DBC / 'AreaTable.dbc').read_bytes()
         sig, count, fields, size, strings = struct.unpack('<4s4I', raw[:20])
@@ -925,6 +932,15 @@ def load_areas():
             AREA_BY_FLAG.setdefault(rec[3], rec[0])
             if 0 < off < len(block):
                 names[rec[0]] = block[off:block.find(b'\0', off)].decode('utf-8', 'replace')
+            if not rec[2] and rec[1] not in (0, 1):
+                tops.setdefault(rec[1], []).append(rec[0])
+        # Подземелье целиком: главная зона его карты (а не «***On Map Dungeon***» из .map-файлов)
+        for mapid, ids in tops.items():
+            MAP_AREA[mapid] = next((a for a in ids if not names.get(a, '').startswith('*')), ids[0])
+        # у Пика и Глубин Чёрной горы своих зон на их картах нет — они числятся за материком
+        for mapid, area in ((229, 1583), (230, 1584)):
+            if area in names and names.get(MAP_AREA.get(mapid), '*').startswith('*'):
+                MAP_AREA[mapid] = area
     except (OSError, struct.error) as e:
         print('AreaTable.dbc не прочитан:', e, file=sys.stderr)
     return names
@@ -1187,6 +1203,9 @@ async def guard(request, handler):
         resp.headers.setdefault(key, value)
     if path.startswith('/api/') or path == '/':
         resp.headers['Cache-Control'] = 'no-store'
+    elif path.startswith('/static/wow/') and resp.status == 200:
+        # картинки игры не меняются: карты, плитки вида сверху (их тысячи) — неделю из кэша браузера
+        resp.headers.setdefault('Cache-Control', 'public, max-age=%d' % (3600 if path.endswith('.json') else 604800))
     return resp
 
 
@@ -4550,7 +4569,51 @@ async def h_quest(request):
         out['kind'] = 'talk'
     npcs = [g['entry'] for g in givers + enders]
     out['status'] = quest_status([entry], npcs)[entry] if entry >= QUEST_MIN else 'live'
+    out.update(await quest_links(q))
     return ok(out)
+
+
+async def quest_links(q):
+    """Цепочка как её собирает ядро (ObjectMgr::LoadQuests): до задания — его PrevQuestId (> 0 — сдать, < 0 — взять)
+    и те, у кого NextQuestId указывает на него; после — его NextQuestId и NextQuestInChain (следующее предложат сразу)
+    и те, у кого PrevQuestId — это задание. ExclusiveGroup > 0 — из группы можно сделать только одно.
+    Плюс в каких событиях задание и какие объекты его выдают и принимают."""
+    entry = q['entry']
+    cols = 'entry, Title AS title, QuestLevel AS level, MinLevel AS min_level'
+    before, after = {}, {}
+    if q['PrevQuestId']:
+        before[abs(q['PrevQuestId'])] = 'done' if q['PrevQuestId'] > 0 else 'active'
+    for r in await dbq(f'SELECT entry FROM {W}.quest_template WHERE ABS(NextQuestId) = %s', (entry,)):
+        before.setdefault(r['entry'], 'done')
+    if q['NextQuestInChain']:
+        after[q['NextQuestInChain']] = 'chain'
+    if q['NextQuestId']:
+        after.setdefault(abs(q['NextQuestId']), 'opens')
+    for r in await dbq(f'SELECT entry FROM {W}.quest_template WHERE PrevQuestId IN (%s, %s)', (entry, -entry)):
+        after.setdefault(r['entry'], 'opens')
+    excl = []
+    if q['ExclusiveGroup'] > 0:
+        excl = [r['entry'] for r in await dbq(f'SELECT entry FROM {W}.quest_template WHERE ExclusiveGroup = %s AND entry <> %s LIMIT 20',
+                                              (q['ExclusiveGroup'], entry))]
+    ids = set(before) | set(after) | set(excl)
+    info = {}
+    if ids:
+        for r in await dbq(f'SELECT {cols} FROM {W}.quest_template WHERE entry IN (%s)' % quest_ids_sql(len(ids)), list(ids)):
+            info[r['entry']] = r
+
+    def lst(d):
+        return [dict(info[k], how=v) for k, v in d.items() if k in info]
+    evs = await event_rows()
+    events = [{'entry': r['event'], 'name': evs[r['event']]['name'], 'icon': evs[r['event']]['icon'], 'theme': evs[r['event']]['theme']}
+              for r in await dbq(f'SELECT event FROM {W}.game_event_quest WHERE quest = %s', (entry,)) if r['event'] in evs]
+    objs = {}
+    for table, key in (('gameobject_questrelation', 'obj_givers'), ('gameobject_involvedrelation', 'obj_enders')):
+        objs[key] = await dbq(f'SELECT r.id AS entry, t.name FROM {W}.{table} r JOIN {W}.gameobject_template t ON t.entry = r.id '
+                              f'WHERE r.quest = %s', (entry,))
+    factions = (await char_dbc())['factions']
+    reps = {q['RewRepFaction%d' % i] for i in range(1, 6) if q['RewRepFaction%d' % i]}
+    return {'chain': {'before': lst(before), 'after': lst(after), 'exclusive': [info[k] for k in excl if k in info]},
+            'events': events, **objs, 'faction_names': {f: factions.get(f, {}).get('name', '') for f in reps}}
 
 
 async def _items_exist(ids, what):
@@ -4858,6 +4921,911 @@ async def export_custom_quests():
     await asyncio.to_thread(QUEST_SQL.write_text, head + '\n'.join(p for p in parts if p), 'utf-8')
 
 
+# --- праздники и события мира -------------------------------------------------
+#
+# События — таблица game_event мировой базы: праздники, ярмарки, выходные полей боя,
+# вторжения и служебные (ночь, колокола). Что каждое добавляет в мир — game_event_creature,
+# _gameobject, _creature_data (другая внешность или оружие у существ), _quest.
+# Когда идёт — решает ядро (GameEventMgr): событие активно, если start < сейчас < end и
+# (сейчас − start) % occurence < length. start/end по виду расписания (schedule_type):
+#   0 — ведёт скрипт ядра (нашествие Плети, война за Ан'Кираж), своего расписания нет;
+#   1 — даты из game_event_time, повтор каждые occurence минут;
+#   2–9 — ярмарка Новолуния по первым понедельникам месяцев (в нашей базе не встречается);
+#   11 — каждый год в те же числа: даты game_event_time переносятся на текущий год;
+#   12 — Лунный фестиваль: второе новолуние после зимнего солнцестояния (как китайский Новый год);
+#   13 — Сад чудес: с Пасхи (формула Гаусса).
+# Панель считает календарь тем же кодом (ниже — перевод GameEventMgr.cpp и moon.cpp ядра).
+#
+# Включить и выключить — консольные команды ядра event start / event stop. Они меняют только
+# память ядра: start = «сейчас» (событие идёт свою обычную длину) или start в прошлом. После
+# перезапуска мира и при еженедельном пересчёте ядро возвращает расписание. Поэтому «держать
+# включённым / выключенным до …» панель помнит сама (event_force в panel.db) и раз в минуту
+# сверяет со списком активных событий ядра (event list).
+#
+# Одновременно идти могут любые события. Но некоторые трогают одних и тех же существ и
+# объекты (Огненный солнцеворот и Новогодняя ночь — 269 общих объектов и 46 существ): когда
+# одно из них кончится, оно уберёт и общие предметы второго. Такие пары панель находит сама
+# (общие guid в game_event_*) и предлагает остановить мешающее событие.
+
+EVENT_CATS = ('holiday', 'fair', 'pvp', 'world', 'service', 'other')
+EVENT_RECURRING = 10080         # минут: чаще раза в неделю — в календаре не рисуем каждое, только «следующее»
+# номер: (раздел, тема оформления, иконка игры, название, о чём)
+EVENT_META = {
+    7: ('holiday', 'lunar', 'inv_misc_elvencoins', 'Лунный фестиваль',
+        'Праздник в честь предков: старейшины по всему миру, монеты предков, лунные фейерверки и приглашение '
+        'в Лунную поляну. Начинается со второго новолуния после зимнего солнцестояния — как китайский Новый год.'),
+    8: ('holiday', 'love', 'inv_valentinescard01', 'Любовная лихорадка',
+        'День всех влюблённых: стража в городах раздаёт поручения, по миру гуляет купидон Кви К. Педдлфит, '
+        'игроки дарят друг другу открытки и шоколад.'),
+    9: ('holiday', 'spring', 'inv_egg_03', 'Сад чудес',
+        'Весенний праздник с Пасхи: в стартовых деревнях прячут разноцветные яйца с подарками.'),
+    10: ('holiday', 'children', 'inv_misc_toy_03', 'Детская неделя',
+         'Сироты Штормграда и Оргриммара просят взять их с собой по миру. За прогулку — питомцы и сладости.'),
+    1: ('holiday', 'fire', 'spell_fire_fire', 'Огненный солнцеворот',
+        'Праздник летнего солнцестояния: костры у городов, хранители огня и задания «украсть пламя» '
+        'у столиц противника.'),
+    33: ('holiday', 'harvest', 'inv_misc_food_33', 'Неделя урожая',
+         'Праздник памяти павших героев: пиршественные столы у Оргриммара и Стальгорна, задания почтить героев.'),
+    12: ('holiday', 'halloween', 'inv_misc_bag_28_halloween', 'Тыквовин',
+         'Праздник Отрёкшихся: Плетёный человек у Подгорода, сладости и костюмы у трактирщиков, проделки в Южнобережье.'),
+    2: ('holiday', 'winter', 'inv_holiday_christmas_present_01', 'Зимний Покров',
+        'Зимний праздник Азерота: Дедушка Зима в Стальгорне и Оргриммаре, ёлки, Гринч в Альтеракских горах '
+        'и подарки под ёлкой в канун праздника.'),
+    6: ('holiday', 'newyear', 'inv_misc_missilelargecluster_red', 'Новогодняя ночь',
+        'Последний вечер года: салют и гуляния в городах.'),
+    4: ('fair', 'faire', 'inv_misc_ticket_darkmoon_01', 'Ярмарка Новолуния — Элвиннский лес',
+        'Ярмарка Сайласа Новолуния у Златоземья: гадалка, аттракционы, обмен купонов и карт Новолуния на награды.'),
+    5: ('fair', 'faire', 'inv_misc_ticket_darkmoon_01', 'Ярмарка Новолуния — Мулгор',
+        'Та же ярмарка у Громового Утёса. Ярмарка ездит: то в Элвиннский лес, то в Мулгор.'),
+    15: ('fair', 'fishing', 'inv_fishingpole_02', 'Рыболовный турнир Тернистой долины',
+         'По воскресеньям: кто первым принесёт Ригглу Басбейту 40 редких рыб, получит награду.'),
+    16: ('fair', 'arena', 'inv_misc_coin_01', 'Сундук арены Гурубаши',
+         'Каждые три часа в центре арены Гурубаши появляется сундук — достанется тому, кто выживет.'),
+    18: ('pvp', 'pvp', 'inv_jewelry_necklace_21', 'Призыв к оружию: Альтеракская долина',
+         'Выходные поля боя: больше чести за бои в Альтеракской долине, посланники зовут в бой в столицах.'),
+    19: ('pvp', 'pvp', 'inv_misc_rune_07', 'Призыв к оружию: Ущелье Песни Войны',
+         'Выходные поля боя: больше чести за бои в Ущелье Песни Войны, посланники в столицах.'),
+    20: ('pvp', 'pvp', 'inv_jewelry_amulet_07', 'Призыв к оружию: Низина Арати',
+         'Выходные поля боя: больше чести за бои в Низине Арати, посланники в столицах.'),
+    11: ('world', 'air', 'spell_nature_cyclone', 'Вторжение стихий: воздух',
+         'Раз в три дня на полтора дня: элементали воздуха и их повелитель приходят в мир.'),
+    13: ('world', 'flame', 'spell_fire_volcano', 'Вторжение стихий: огонь',
+         'Раз в три дня на полтора дня: элементали огня и их повелитель приходят в мир.'),
+    38: ('world', 'water', 'spell_frost_summonwaterelemental', 'Вторжение стихий: вода',
+         'Раз в три дня на полтора дня: элементали воды и их повелительница приходят в мир.'),
+    39: ('world', 'earth', 'spell_nature_earthquake', 'Вторжение стихий: земля',
+         'Раз в три дня на полтора дня: элементали земли и их повелитель приходят в мир.'),
+    29: ('world', 'madness', 'inv_misc_idol_03', "Грань безумия: Гри'лек",
+         "Зул'Гуруб: кто из четырёх древних богов-троллей ждёт на Грани безумия. Меняются по очереди."),
+    30: ('world', 'madness', 'inv_misc_idol_03', "Грань безумия: Хазза'рах",
+         "Зул'Гуруб: кто из четырёх древних богов-троллей ждёт на Грани безумия. Меняются по очереди."),
+    31: ('world', 'madness', 'inv_misc_idol_03', 'Грань безумия: Ренатаки',
+         "Зул'Гуруб: кто из четырёх древних богов-троллей ждёт на Грани безумия. Меняются по очереди."),
+    32: ('world', 'madness', 'inv_misc_idol_03', 'Грань безумия: Вушулай',
+         "Зул'Гуруб: кто из четырёх древних богов-троллей ждёт на Грани безумия. Меняются по очереди."),
+    17: ('world', 'scourge', 'spell_shadow_raisedead', 'Нашествие Плети',
+         'Некрополи Плети над Азеротом и Серебряный Рассвет против них. Нападения на зоны ведёт скрипт ядра.'),
+    22: ('world', 'aq', 'inv_misc_ahnqirajtrinket_04', "Война за Ан'Кираж",
+         "Сбор ресурсов к открытию Ан'Киража и удар в гонг. Этапы ведёт скрипт ядра."),
+    100: ('world', 'storm', 'spell_nature_timestop', 'Перед бурей',
+          'Событие к выходу дополнения The Burning Crusade. Ведёт скрипт ядра.'),
+    85: ('world', 'competition', 'inv_misc_coin_02', 'Дух состязания',
+         'Событие дополнения The Burning Crusade, в классике отключено.'),
+    21: ('service', 'winter', 'inv_misc_gift_02', 'Зимний Покров: подарки под ёлкой',
+         'С вечера 25 декабря под ёлками лежат подарки.'),
+    24: ('service', 'halloween', 'spell_fire_flameshock', 'Тыквовин: угли Плетёного человека',
+         'Каждый вечер праздника Плетёного человека поджигают.'),
+    25: ('service', 'halloween', 'inv_misc_head_undead_01', 'Тыквовин: речь королевы банши',
+         'Каждый вечер праздника Сильвана выходит к Плетёному человеку.'),
+    14: ('service', 'fishing', 'inv_misc_fish_19', 'Рыболовный турнир: объявление',
+         'За несколько часов до турнира глашатаи объявляют о нём.'),
+    34: ('service', 'fishing', 'inv_misc_fish_02', 'Рыболовный турнир: сдача улова',
+         'После турнира улов ещё можно сдать.'),
+    23: ('service', 'faire', 'inv_box_02', 'Ярмарка в Элвиннском лесу: стройка, этап 1', 'Ярмарку собирают перед открытием.'),
+    26: ('service', 'faire', 'inv_box_02', 'Ярмарка в Элвиннском лесу: стройка, этап 2', 'Ярмарку собирают перед открытием.'),
+    28: ('service', 'faire', 'inv_box_02', 'Ярмарка в Мулгоре: стройка, этап 1', 'Ярмарку собирают перед открытием.'),
+    37: ('service', 'faire', 'inv_box_02', 'Ярмарка в Мулгоре: стройка, этап 2', 'Ярмарку собирают перед открытием.'),
+    27: ('service', 'night', 'spell_nature_starfall', 'Ночь', 'Каждый вечер: ночная смена существ и огни в городах.'),
+    400: ('service', 'day', 'spell_holy_holysmite', 'День (7:00–20:00)', 'Дневные существа и предметы.'),
+    401: ('service', 'day', 'spell_holy_holysmite', 'Утро (7:00–12:00)', 'Утренние существа и предметы.'),
+    1024: ('service', 'day', 'inv_misc_bell_01', 'Колокола каждый час', 'Городские колокола бьют каждый час.'),
+    35: ('service', 'fishing', 'inv_misc_fish_02', 'Зимний сезон рыбалки', 'Какая рыба ловится зимой.'),
+    36: ('service', 'fishing', 'inv_misc_fish_19', 'Летний сезон рыбалки', 'Какая рыба ловится летом.'),
+}
+# части больших событий, не связанные через linkedTo: подсобытие → главное
+EVENT_PARENT = {21: 2, 14: 15, 34: 15, 23: 4, 26: 4, 28: 5, 37: 5,
+                **{e: 17 for e in range(89, 100)}, **{e: 22 for e in range(120, 136)}}
+# Как часть связана с главным. С linkedTo (угли и речь на Тыквовине) ядро само включает часть в её время,
+# но только пока идёт главное — 'core'. Этапы событий без расписания включает скрипт ядра — 'script'.
+# Остальные ядро с главным не связывает, у них свой календарь: 'during' — идут в разгар праздника,
+# 'before' — готовят его (стройка ярмарки, объявление турнира), 'after' — после (сдача улова).
+EVENT_ROLE = {21: 'during', 14: 'before', 34: 'after', 23: 'before', 26: 'before', 28: 'before', 37: 'before'}
+EVENT_CACHE = {'ts': 0, 'data': None}
+EVENT_PLACES = {}             # событие → (когда посчитано, где проходит)
+EVENT_LIST_RE = re.compile(r'^\s*(\d+)\s+-\s+(.*?)\s*(\[active\])?\s*$')
+
+
+# ---- календарь ядра: перевод GameEventMgr::ComputeEventStartAndEndTime и moon.cpp
+
+def _mk(year, mon0, mday, hour=0, minute=0, sec=0):
+    """Как mktime ядра: месяц с нуля, день и часы могут выходить за пределы — переносятся дальше."""
+    y, m = year + mon0 // 12, mon0 % 12
+    return (datetime(y, m + 1, 1) + timedelta(days=mday - 1, hours=hour, minutes=minute, seconds=sec)).timestamp()
+
+
+def _is_dst(ts):
+    return time.localtime(ts).tm_isdst > 0
+
+
+def _cal2jul(mon, day, year):
+    jy = year
+    if jy == 0:
+        return 0
+    if jy < 0:
+        jy += 1
+    if mon > 2:
+        jm = mon + 1
+    else:
+        jy -= 1
+        jm = mon + 13
+    jul = int(math.floor(365.25 * jy) + math.floor(30.6001 * jm) + day + 1720995)
+    if day + 31 * (mon + 12 * year) >= 15 + 31 * (10 + 12 * 1582):
+        ja = int(0.01 * jy)
+        jul += 2 - ja + int(0.25 * ja)
+    return jul
+
+
+def _jul2cal(jd):
+    if jd >= 2299161:
+        a = int(((jd - 1867216) - 0.25) / 36524.25)
+        a = int(jd + 1 + a - int(0.25 * a))
+    else:
+        a = jd
+    b = a + 1524
+    c = int(6680 + ((b - 2439870) - 122.1) / 365.25)
+    d = 365 * c + int(0.25 * c)
+    e = int((b - d) / 30.6001)
+    day = int(b - d - int(30.6001 * e))
+    mon = int(e - 1)
+    if mon > 12:
+        mon -= 12
+    year = int(c - 4715)
+    if mon > 2:
+        year -= 1
+    if year <= 0:
+        year -= 1
+    return mon, day, year
+
+
+def _flmoon(n, nph):
+    rad = 3.1415926535897 / 180.0
+    cycles = n + nph / 4.0
+    t = cycles / 1236.85
+    t2 = t * t
+    sun = 359.2242 + 29.10535608 * cycles
+    moon = 306.0253 + 385.81691806 * cycles + 0.010730 * t2
+    xtra = 0.75933 + 1.53058868 * cycles + ((1.78e-4) - (1.55e-7) * t) * t2
+    jd = 2415020 + 28 * n + 7 * nph
+    if nph in (0, 2):
+        xtra += (0.1734 - 3.93e-4 * t) * math.sin(rad * sun) - 0.4068 * math.sin(rad * moon)
+    else:
+        xtra += (0.1721 - 4.0e-4 * t) * math.sin(rad * sun) - 0.6280 * math.sin(rad * moon)
+    whole = math.floor(xtra) if xtra >= 0 else math.ceil(xtra - 1.0)
+    jd += int(whole)
+    return jd + (xtra - whole), jd
+
+
+def _nextphase(mon, day, year, nph=0):
+    """Moon::nextphase: дата и время ближайшей фазы nph (0 — новолуние) не раньше данного дня."""
+    n = int(12.37 * ((year - 1900) + ((mon - 0.5) / 12.0)))
+    jd = _cal2jul(mon, day, year)
+    djd, ph_jd = _flmoon(n, nph)
+    while jd < ph_jd:
+        n -= 1
+        djd, ph_jd = _flmoon(n, nph)
+    while jd > ph_jd:
+        n += 1
+        djd, ph_jd = _flmoon(n, nph)
+    djd += 0.5
+    if time.localtime().tm_isdst > 0:
+        djd -= 1.0 / 24.0
+    ph_jd = math.floor(djd)
+    m, d, y = _jul2cal(jd)
+    if _is_dst(_mk(y, m - 1, d, 3)):
+        djd += 1.0 / 24.0
+        ph_jd = math.floor(djd)
+    frac = (djd - math.floor(djd)) * 24.0
+    hour = int(math.floor(frac) if frac >= 0.0 else math.ceil(frac - 1.0))
+    minute = int(math.floor(60 * (frac - hour)))
+    mon, day, year = _jul2cal(int(ph_jd))
+    return mon, day, year, hour, minute
+
+
+def _lunar_start(year):
+    """Начало Лунного фестиваля в году year — как у ядра: второе новолуние после 21 декабря прошлого
+    года, полночь по местному времени того дня, когда в Китае (GMT+8) уже новолуние."""
+    mon, day, y, hour, minute = _nextphase(12, 21, year - 1)
+    lt = time.localtime(_mk(y, mon, day + 1, hour, minute))       # ядро кладёт месяц с единицы в tm_mon
+    mon, day, y, hour, minute = _nextphase(lt.tm_mon - 1, lt.tm_mday, lt.tm_year)
+    china = datetime.fromtimestamp(_mk(y, mon - 1, day, hour + 8))
+    return datetime(china.year, china.month, china.day)
+
+
+def _easter(year):
+    """gaussEaster ядра (с его же целочисленными делениями)."""
+    a, b, c = year % 19, year % 4, year % 7
+    p = math.floor(year / 100)
+    q = math.floor((13 + 8 * p) / 25)
+    m = int(15 - q + p - p / 4) % 30
+    n = int(4 + p - p / 4) % 7
+    d = int(19 * a + m) % 30
+    e = int(2 * b + 4 * c + 6 * d + n) % 7
+    days = int(22 + d + e)
+    if d == 29 and e == 6:
+        return datetime(year, 4, 19)
+    if d == 28 and e == 6:
+        return datetime(year, 4, 18)
+    return datetime(year, 4, days - 31) if days > 31 else datetime(year, 3, days)
+
+
+def _same_date(dt, year):
+    try:
+        return dt.replace(year=year)
+    except ValueError:                                      # 29 февраля в невисокосный год — mktime даст 1 марта
+        return dt.replace(year=year, month=3, day=1)
+
+
+def _dmf_span(stype, today):
+    first = datetime(today.year, today.month, today.day)
+    rem = (today.month - 1) % 3
+    add = (3 - rem) % 3 if stype in (2, 5, 8) else (3 - rem + 1) % 3
+    first = datetime.fromtimestamp(_mk(first.year, first.month - 1 + add, first.day))
+    wday = (first.weekday() + 1) % 7                        # как tm_wday: воскресенье — 0
+    monday = (first.day - wday + 7) % 7 + 1
+    shift = {5: -2, 6: -2, 8: -1, 9: -1}.get(stype, 0)
+    start = _mk(first.year, first.month - 1, monday + shift)
+    return start, _mk(first.year, first.month - 1, monday + shift + (7 if stype in (2, 3) else 1))
+
+
+def _cycle(start, end, occ, length, frm, to):
+    """Окна [начало, конец) события с повтором occ и длиной length (минуты) между frm и to."""
+    step, span = occ * 60, length * 60
+    out = []
+    k = max(0, int((frm - start) // step) - 1)
+    s = start + k * step
+    while s < min(to, end):
+        e = min(s + span, end)
+        if e > frm and e > s:
+            out.append((int(s), int(e)))
+        s += step
+    return out
+
+
+def event_windows(ev, frm, to):
+    """Когда событие идёт по расписанию ядра между frm и to: список (начало, конец)."""
+    st, occ, ln = ev['schedule_type'], ev['occurence'], ev['length']
+    if st == 0 or not occ or not ln or occ < ln:
+        return []
+    if st == 1:
+        if not ev['start']:
+            return []
+        return _cycle(ev['start'].timestamp(), ev['end'].timestamp(), occ, ln, frm, to)
+    out = []
+    first, last = datetime.fromtimestamp(frm), datetime.fromtimestamp(to)
+    for year in range(first.year - 1, last.year + 1):
+        if st == 11:
+            if not ev['start']:
+                return []
+            spans = [(_same_date(ev['start'], year).timestamp(), _same_date(ev['end'], year).timestamp())]
+        elif st == 12:
+            s = _lunar_start(year)
+            spans = [(s.timestamp(), (s + timedelta(days=21)).timestamp())]
+        elif st == 13:
+            s = _easter(year)
+            spans = [(s.timestamp(), (s + timedelta(days=7)).timestamp())]
+        elif 2 <= st <= 9:
+            spans = [_dmf_span(st, datetime(year, m, 1)) for m in range(1, 13)]
+        else:
+            return []
+        for s, e in spans:
+            out += _cycle(s, e, occ, ln, frm, to)
+    return sorted(set(out))
+
+
+# ---- что знает база
+
+def ruled(ev):
+    """Ведёт ли событие расписание ядра. Только такие панель держит на срок и возвращает к расписанию;
+    остальные (без расписания, отключённые в базе) включают скрипт ядра или вы."""
+    st = ev['schedule_type']
+    if st == 0 or not ev['occurence'] or not ev['length'] or ev['occurence'] < ev['length']:
+        return False
+    if st in (1, 11) and not ev['start']:
+        return False
+    return st != 1 or bool(ev['end'] and ev['end'] > datetime.now())
+
+
+def part_kind(ev, evs):
+    if not ev['parent']:
+        return None
+    if ev['linkedTo']:
+        return 'core'
+    if ev['schedule_type'] == 0 or evs.get(ev['parent'], {}).get('schedule_type') == 0:
+        return 'script'
+    return EVENT_ROLE.get(ev['entry'], 'during')
+
+
+async def event_rows():
+    """Все события: расписание, родитель, что добавляют, с кем конфликтуют. Кэш на 5 минут."""
+    if EVENT_CACHE['data'] and time.time() - EVENT_CACHE['ts'] < 300:
+        return EVENT_CACHE['data']
+    rows = await dbq(f'SELECT entry, schedule_type, occurence, length, holiday, linkedTo, description FROM {W}.game_event ORDER BY entry')
+    times = {r['entry']: r for r in await dbq(f'SELECT entry, start_time, end_time FROM {W}.game_event_time')}
+    counts = {}
+    for table, key in (('game_event_creature', 'creatures'), ('game_event_gameobject', 'objects'), ('game_event_quest', 'quests'),
+                       ('game_event_creature_data', 'changes')):
+        for r in await dbq(f'SELECT event, COUNT(*) AS n FROM {W}.{table} GROUP BY event'):
+            counts.setdefault(abs(r['event']), {})[key if r['event'] > 0 else key + '_off'] = r['n']
+    evs = {}
+    for r in rows:
+        t = times.get(r['entry']) or {}
+        meta = EVENT_META.get(r['entry'])
+        parent = r['linkedTo'] or EVENT_PARENT.get(r['entry']) or 0
+        cat = meta[0] if meta else ('service' if parent else 'world' if r['schedule_type'] == 0 else 'other')
+        evs[r['entry']] = {
+            'entry': r['entry'], 'schedule_type': r['schedule_type'], 'occurence': r['occurence'], 'length': r['length'],
+            'holiday': r['holiday'], 'linkedTo': r['linkedTo'], 'parent': parent, 'name_en': (r['description'] or '').strip(),
+            'name': meta[3] if meta else (r['description'] or '').strip() or '#%d' % r['entry'],
+            'about': meta[4] if meta else '', 'cat': cat, 'theme': meta[1] if meta else 'service',
+            'icon': meta[2] if meta else 'inv_misc_note_01',
+            'start': t.get('start_time'), 'end': t.get('end_time'), 'counts': counts.get(r['entry'], {}),
+            'children': [], 'conflicts': {},
+        }
+    for e in evs.values():
+        if e['parent'] in evs:
+            evs[e['parent']]['children'].append(e['entry'])
+    for e in evs.values():
+        e['part'] = part_kind(e, evs)
+        e['ruled'] = ruled(e)
+
+    def root(entry):
+        seen = set()
+        while evs.get(entry) and evs[entry]['parent'] in evs and entry not in seen:
+            seen.add(entry)
+            entry = evs[entry]['parent']
+        return entry
+    # общие существа и объекты у разных событий (не родитель с подсобытием): одно кончится — уберёт и чужое.
+    # Служебные (ночь, день, колокола) не считаем: ядро и так гоняет их вместе с праздниками каждый день;
+    # один общий объект — тоже не повод.
+    pairs = {}
+    for table in ('game_event_creature', 'game_event_gameobject', 'game_event_creature_data'):
+        for r in await dbq(f'SELECT a.event AS a, b.event AS b, COUNT(*) AS n FROM {W}.{table} a JOIN {W}.{table} b '
+                           f'ON a.guid = b.guid AND a.event <> b.event GROUP BY a.event, b.event'):
+            a, b = abs(r['a']), abs(r['b'])
+            if a != b and a in evs and b in evs and root(a) != root(b) and 'service' not in (evs[a]['cat'], evs[b]['cat']):
+                pairs[a, b] = pairs.get((a, b), 0) + r['n']
+    for (a, b), n in pairs.items():
+        if n >= 2:
+            evs[a]['conflicts'][b] = n
+    for e in evs.values():
+        e['root'] = root(e['entry'])
+    EVENT_CACHE.update(ts=time.time(), data=evs)
+    return evs
+
+
+async def active_events():
+    """Номера событий, которые ядро сейчас считает активными; None — мир не отвечает."""
+    if not scan_procs().get('mangosd'):
+        return None
+    good, text = await soap('event list', timeout=8)
+    if not good or text is None:
+        return None
+    return {int(m.group(1)) for m in map(EVENT_LIST_RE.match, text.splitlines()) if m and m.group(3)}
+
+
+def event_forces():
+    with panel_db() as conn:
+        return {r['entry']: dict(r) for r in conn.execute('SELECT entry, mode, until, ts, kind FROM event_force')}
+
+
+def event_guards():
+    with panel_db() as conn:
+        return {r['entry']: dict(r) for r in conn.execute('SELECT entry, pid, ts FROM event_guard')}
+
+
+def _event_guard(entry, pid):
+    """pid мира — следить за временем события до его перезапуска; None — перестать."""
+    with panel_db() as conn:
+        if pid:
+            conn.execute('REPLACE INTO event_guard(entry, pid, ts) VALUES (?,?,?)', (entry, pid, int(time.time())))
+        else:
+            conn.execute('DELETE FROM event_guard WHERE entry = ?', (entry,))
+
+
+def scheduled_now(ev, now):
+    return any(s <= now < e for s, e in event_windows(ev, now - 1, now + 1))
+
+
+def natural_on(ev, active, now):
+    """Шло бы событие сейчас само: по расписанию, а часть с linkedTo — ещё и только при идущем главном."""
+    return scheduled_now(ev, now) and (not ev['linkedTo'] or ev['linkedTo'] in active)
+
+
+def at_boundary(ev, on, now):
+    """Только что прошла граница расписания: начало (on) или конец окна. Команда в этот миг ставит
+    ядру время события ровно как по расписанию — «.event start» считает начало от «сейчас»,
+    «.event stop» — конец."""
+    return any(now - 150 <= (s if on else e) <= now for s, e in event_windows(ev, now - 300, now + 300))
+
+
+def event_state(ev, now, active, forces, frm, to, guards=None):
+    if ev['occurence'] >= EVENT_RECURRING:
+        wins = event_windows(ev, min(frm, now - 86400), max(to, now + 400 * 86400))
+        shown = [w for w in wins if w[1] > frm and w[0] < to]
+    else:                                                   # каждый день или час: только текущее и следующее
+        wins, shown = event_windows(ev, now - 86400, now + 30 * 86400), []
+    cur = next((w for w in wins if w[0] <= now < w[1]), None)
+    nxt = next((w for w in wins if w[0] > now), None)
+    return {
+        'entry': ev['entry'], 'name': ev['name'], 'name_en': ev['name_en'], 'cat': ev['cat'], 'theme': ev['theme'],
+        'icon': ev['icon'], 'about': ev['about'], 'parent': ev['parent'], 'root': ev['root'], 'children': ev['children'],
+        'schedule_type': ev['schedule_type'], 'occurence': ev['occurence'], 'length': ev['length'],
+        'windows': shown, 'current': cur, 'next': nxt, 'scheduled': bool(cur),
+        'active': (ev['entry'] in active) if active is not None else None,
+        'force': forces.get(ev['entry']), 'counts': ev['counts'],
+        'conflicts': sorted(ev['conflicts']),
+        'part': ev['part'], 'ruled': ev['ruled'], 'linkedTo': ev['linkedTo'],
+        'natural': natural_on(ev, active, now) if active is not None else bool(cur),
+        'guard': bool(guards and ev['entry'] in guards),
+    }
+
+
+async def h_events(request):
+    year = int_arg(request.query.get('year') or datetime.now().year, 2000, 2100, 'Год')
+    frm = datetime(year, 1, 1).timestamp() - 40 * 86400
+    to = datetime(year + 1, 1, 1).timestamp() + 40 * 86400
+    evs = await event_rows()
+    active = await active_events()
+    forces, guards = event_forces(), event_guards()
+    now = time.time()
+    items = [event_state(e, now, active, forces, frm, to, guards) for e in evs.values()]
+    return ok({'year': year, 'now': int(now), 'world': active is not None, 'events': items})
+
+
+async def h_event(request):
+    entry = int_arg(request.query.get('entry'), 1, 65535, 'Событие')
+    evs = await event_rows()
+    ev = evs.get(entry)
+    need(ev, 'Такого события нет.')
+    active = await active_events()
+    now = time.time()
+    forces, guards = event_forces(), event_guards()
+    state = event_state(ev, now, active, forces, now - 86400, now + 86400, guards)
+    later = event_windows(ev, now - 30 * 86400, now + 760 * 86400)
+    state['upcoming'] = later[:8] if ev['occurence'] >= EVENT_RECURRING else later[:4]
+    fam = [entry] + ev['children']
+    marks = ','.join('%s' for _ in fam)
+    crs = await dbq(f'''SELECT ct.Entry AS entry, ct.Name AS name, ct.SubName AS sub, ct.DisplayId1 AS display,
+                               ct.NpcFlags AS flags, COUNT(*) AS n
+                        FROM {W}.game_event_creature ge JOIN {W}.creature c ON c.guid = ge.guid
+                        JOIN {W}.creature_template ct ON ct.Entry = c.id
+                        WHERE ge.event IN ({marks}) AND ct.CreatureType <> 10
+                        GROUP BY ct.Entry ORDER BY (ct.NpcFlags > 0) DESC, n DESC LIMIT 12''', fam)
+    state['creatures'] = [{'entry': c['entry'], 'name': c['name'], 'sub': c['sub'], 'n': c['n'],
+                           'thumb': thumb_url(c['display']) if c['display'] else None} for c in crs]
+    state['quests'] = await dbq(f'''SELECT q.entry, q.Title AS title, q.MinLevel AS min_level FROM {W}.game_event_quest gq
+                                    JOIN {W}.quest_template q ON q.entry = gq.quest WHERE gq.event IN ({marks})
+                                    ORDER BY q.MinLevel, q.Title LIMIT 60''', fam)
+    state['family'] = [event_state(evs[c], now, active, forces, now - 86400, now + 86400, guards) for c in ev['children'] if c in evs]
+    state['conflict_list'] = [{'entry': c, 'name': evs[c]['name'], 'n': ev['conflicts'][c],
+                               'active': (c in active) if active is not None else None} for c in sorted(ev['conflicts']) if c in evs]
+    state['parent_name'] = evs[ev['parent']]['name'] if ev['parent'] in evs else None
+    state['core'] = None
+    if active is not None:
+        good, text = await soap('event %d' % entry, timeout=8)
+        if good and text:
+            state['core'] = re.sub(r'\s*(Start:|End:|Occurence:|Length:|Next state change:)', r'\n\1', text).strip()
+    return ok(state)
+
+
+def area_at(mapid, x, y):
+    """Флаг зоны в точке из .map-файлов сервера (как terrain_at, но без высоты); 0 — данных нет."""
+    gx, gy = int(32 - x / GRID_SIZE), int(32 - y / GRID_SIZE)
+    grid = _grid(mapid, gx, gy) if 0 <= gx < 64 and 0 <= gy < 64 else None
+    if not grid:
+        return 0
+    ax, ay, _, _ = _cell(x, y, 16)
+    return grid['area'][(ax & 15) * 16 + (ay & 15)] if grid['area'] else grid['garea']
+
+
+# Стальгорн внутри горы, Подгород под землёй: в .map-файлах там зона поверхности (Дун Морог,
+# Тирисфальские леса). Точка ниже земли в границах города на карте мира — значит, в городе. Над Подгородом
+# в земле дыра (высоты нет), а руины Лордерона наверху стоят на высоте ~60 — там решает «пол» города.
+CITY_UNDER = {1537: None, 1497: 20.0}       # город → высота, ниже которой точка в нём, если земли над ней нет
+CITY_BOUNDS = {}
+
+
+def city_bounds():
+    if not CITY_BOUNDS:
+        try:
+            for z in json.loads((STATIC / 'wow' / 'maps' / 'maps.json').read_text(encoding='utf-8'))['zones']:
+                if z['area'] in CITY_UNDER:
+                    CITY_BOUNDS[z['area']] = (z['map'], z['bounds'])
+        except (OSError, ValueError, KeyError):
+            CITY_BOUNDS[0] = None                   # карт нет — не искать каждый раз
+    return CITY_BOUNDS
+
+
+def event_places(points):
+    """Где событие: [(вид, карта, x, y, z)] → зоны со счётом существ и объектов, подзонами и точками для карты.
+    Точки идут по файлам карты подряд, чтобы каждый .map читался один раз."""
+    zones = {}
+    cities = city_bounds()
+    for kind, mapid, x, y, height in sorted(points, key=lambda p: (p[1], int(32 - p[2] / GRID_SIZE), int(32 - p[3] / GRID_SIZE))):
+        place = place_name(area_at(mapid, x, y))
+        if mapid not in (0, 1) and mapid in MAP_AREA and (not place['zone'] or place['zone_name'].startswith('*')):
+            place = {'area': 0, 'zone': MAP_AREA[mapid], 'zone_name': AREAS.get(MAP_AREA[mapid], '')}
+        for city, floor in CITY_UNDER.items():
+            cb = cities.get(city)
+            if cb and cb[0] == mapid:
+                left, right, top, bottom = cb[1]
+                if 0 <= (left - y) / (left - right) <= 1 and 0 <= (top - x) / (top - bottom) <= 1:
+                    ground = terrain_at(mapid, x, y)[0]
+                    if (ground is not None and height < ground - 3) or (ground is None and floor is not None and height < floor):
+                        place = {'area': 0, 'zone': city, 'zone_name': AREAS.get(city, '')}
+        z = zones.setdefault((mapid, place['zone']), {'map': mapid, 'zone': place['zone'], 'zone_name': place['zone_name'],
+                                                      'creatures': 0, 'objects': 0, 'areas': {}, 'points': []})
+        z[kind] += 1
+        if place['area'] and place['area'] != place['zone']:
+            z['areas'][place['area']] = z['areas'].get(place['area'], 0) + 1
+        if len(z['points']) < 150:
+            z['points'].append([round(x, 1), round(y, 1), 1 if kind == 'creatures' else 0])
+    out = []
+    for z in zones.values():
+        z['areas'] = [{'area': a, 'area_name': AREAS.get(a, ''), 'n': n}
+                      for a, n in sorted(z['areas'].items(), key=lambda kv: -kv[1])[:8]]
+        out.append(z)
+    return sorted(out, key=lambda z: -(z['creatures'] + z['objects']))
+
+
+async def h_event_places(request):
+    entry = int_arg(request.query.get('entry'), 1, 65535, 'Событие')
+    evs = await event_rows()
+    ev = evs.get(entry)
+    need(ev, 'Такого события нет.')
+    hit = EVENT_PLACES.get(entry)
+    if hit and time.time() - hit[0] < 3600:
+        return ok(hit[1])
+    fam = [entry] + ev['children']
+    marks = ','.join('%s' for _ in fam)
+    crs = await dbq(f'''SELECT c.map, c.position_x AS x, c.position_y AS y, c.position_z AS z FROM {W}.game_event_creature ge
+                        JOIN {W}.creature c ON c.guid = ge.guid WHERE ge.event IN ({marks})''', fam)
+    gos = await dbq(f'''SELECT g.map, g.position_x AS x, g.position_y AS y, g.position_z AS z FROM {W}.game_event_gameobject ge
+                        JOIN {W}.gameobject g ON g.guid = ge.guid WHERE ge.event IN ({marks})''', fam)
+    points = [('creatures', r['map'], float(r['x']), float(r['y']), float(r['z'])) for r in crs] + \
+             [('objects', r['map'], float(r['x']), float(r['y']), float(r['z'])) for r in gos]
+    places = await asyncio.to_thread(event_places, points)
+    EVENT_PLACES[entry] = (time.time(), places)
+    return ok(places)
+
+
+def _event_force_set(entry, mode, until, kind='keep'):
+    with panel_db() as conn:
+        if mode:
+            conn.execute('REPLACE INTO event_force(entry, mode, until, ts, kind) VALUES (?,?,?,?,?)',
+                         (entry, mode, until, int(time.time()), kind))
+        else:
+            conn.execute('DELETE FROM event_force WHERE entry = ?', (entry,))
+
+
+async def _event_cmd(ev, on, why):
+    word = 'start' if on else 'stop'
+    res = await run_cmd('event.' + word, '%s «%s» (#%d)%s' % ('включено' if on else 'выключено', ev['name'], ev['entry'], why),
+                        'event %s %d' % (word, ev['entry']))
+    return res
+
+
+def _current_window(ev, now):
+    return next((w for w in event_windows(ev, now - 1, now + 1) if w[0] <= now < w[1]), None)
+
+
+def _force_why(f):
+    word = 'включённым' if f['mode'] == 'on' else 'выключенным'
+    if f.get('kind') == 'run':
+        return '%s вручную%s' % ('включено' if f['mode'] == 'on' else 'выключено', ' до ' + when_text(f['until']) if f['until'] else '')
+    return 'панель держит его ' + word
+
+
+async def h_event_action(request):
+    """«Включить/Выключить сейчас» у события с расписанием — это срок, который панель держит сама: ядро
+    после «.event start/stop» считает время события от этой минуты, а после перезапуска мира или
+    еженедельного пересчёта сбрасывает ручное. Когда срок выйдет, панель вернёт расписание."""
+    data = await body(request)
+    entry = int_arg(data.get('entry'), 1, 65535, 'Событие')
+    action = data.get('action')
+    need(action in ('start', 'stop', 'keep_on', 'keep_off', 'auto'), 'Неизвестное действие.')
+    evs = await event_rows()
+    ev = evs.get(entry)
+    need(ev, 'Такого события нет.')
+    now = time.time()
+    until = None
+    if data.get('until'):
+        until = int_arg(data.get('until'), int(now) + 60, int(now) + 400 * 86400, 'Срок')
+    active = await active_events()
+    need(active is not None or action not in ('start', 'stop'),
+         'Мир не запущен или не отвечает — включить или выключить событие сейчас нельзя. '
+         'Можно выбрать «держать включённым/выключенным»: панель применит это при запуске мира.')
+    pid = scan_procs().get('mangosd') if active is not None else None
+    on = action in ('start', 'keep_on')
+    parts = [evs[c] for c in ev['children'] if c in evs]
+    lines = []
+
+    def guard(e):
+        if pid and e['ruled']:
+            _event_guard(e['entry'], pid)
+
+    if action == 'auto':
+        _event_force_set(entry, None, None)
+        forces = event_forces()
+        for p in parts:                                     # части, включённые вместе с ним, — тоже по расписанию
+            if forces.get(p['entry'], {}).get('mode') == 'on':
+                _event_force_set(p['entry'], None, None)
+        audit('event.keep', '«%s» (#%d): снова по расписанию' % (ev['name'], entry))
+        lines.append('Событие снова идёт по расписанию ядра.')
+        if active is None:
+            return ok({'success': True, 'output': '\n'.join(lines + ['Мир сейчас не запущен — при запуске ядро возьмёт расписание само.'])})
+        guard(ev)
+        on = natural_on(ev, active, now)
+        if on == (entry in active):
+            return ok({'success': True, 'output': '\n'.join(lines)})
+    elif action in ('keep_on', 'keep_off'):
+        _event_force_set(entry, 'on' if on else 'off', until, 'keep')
+        lines.append('Панель держит событие %s%s и раз в минуту проверяет это, в том числе после перезапуска мира.' % (
+            'включённым' if on else 'выключенным', ' до %s' % when_text(until) if until else ''))
+        if not on and parts:
+            lines.append('Его части панель тоже не пустит, пока оно выключено.')
+        audit('event.keep', '«%s» (#%d): держать %s%s' % (ev['name'], entry, 'включённым' if on else 'выключенным',
+                                                          ' до ' + when_text(until) if until else ''))
+    elif ev['ruled']:
+        cur = _current_window(ev, now)
+        nat = bool(cur) and natural_on(ev, active, now)
+        if on:
+            hold = cur[1] if nat else int(now + ev['length'] * 60)
+            _event_force_set(entry, 'on', hold, 'run')
+            lines.append('Событие идёт до %s. Панель держит его до конца срока — даже если мир перезапустится, — '
+                         'а потом вернёт расписание.' % when_text(hold))
+        elif nat:
+            _event_force_set(entry, 'off', cur[1], 'run')
+            lines.append('Событие выключено до %s — до конца срока по расписанию. Потом всё пойдёт как обычно.' % when_text(cur[1]))
+        else:
+            _event_force_set(entry, None, None)
+            lines.append('Дальше — по расписанию.')
+        guard(ev)
+    elif on:
+        lines.append('Своего расписания у события нет: оно идёт, пока его не выключат — вы или скрипт ядра.')
+
+    if active is None:
+        lines.append('Мир сейчас не запущен — панель применит это, как только он поднимется.')
+        return ok({'success': True, 'output': '\n'.join(lines)})
+    if on and data.get('stop_conflicts'):
+        for c in ev['conflicts']:
+            if c in active and c in evs:
+                res = await _event_cmd(evs[c], False, ' — мешало «%s»' % ev['name'])
+                lines.append('Остановлено «%s»: %s' % (evs[c]['name'], 'готово' if res['success'] else res['output'] or 'не вышло'))
+                if res['success']:
+                    active.discard(c)
+                    guard(evs[c])
+                if action == 'keep_on':
+                    _event_force_set(c, 'off', until, 'keep')
+    if on != (entry in active):
+        res = await _event_cmd(ev, on, '')
+        lines.append(res['output'] or ('Готово.' if res['success'] else 'Ядро не выполнило команду.'))
+        need(res['success'], '\n'.join(lines))
+        (active.add if on else active.discard)(entry)
+    else:
+        lines.append('Оно и так %s.' % ('идёт' if on else 'не идёт'))
+
+    # части события
+    if on:
+        chosen = {int(x) for x in data.get('parts') or [] if str(x).isdigit()}
+        f = event_forces().get(entry)
+        for p in parts:
+            if p['entry'] in chosen and p['part'] == 'during' and p['ruled']:
+                _event_force_set(p['entry'], 'on', f['until'] if f else until, f['kind'] if f else 'keep')
+                if p['entry'] not in active:
+                    res = await _event_cmd(p, True, ' — вместе с «%s»' % ev['name'])
+                    lines.append('Включено и «%s»: %s' % (p['name'], 'готово' if res['success'] else res['output'] or 'не вышло'))
+            elif p['part'] == 'before' and p['entry'] in active:
+                res = await _event_cmd(p, False, ' — «%s» уже идёт' % ev['name'])
+                lines.append('Выключено «%s»: оно готовит событие, а то уже идёт — %s' % (
+                    p['name'], 'готово' if res['success'] else res['output'] or 'не вышло'))
+                guard(p)
+        core = ['«%s»' % p['name'] for p in parts if p['part'] == 'core']
+        if core:
+            lines.append('%s ядро включит само в своё время, пока идёт событие.' % ', '.join(core))
+    elif data.get('with_parts', True):
+        forces = event_forces()
+        for p in parts:
+            if forces.get(p['entry'], {}).get('mode') == 'on':
+                _event_force_set(p['entry'], None, None)
+            if p['entry'] in active:
+                res = await _event_cmd(p, False, ' — вместе с «%s»' % ev['name'])
+                lines.append('Выключено и «%s»: %s' % (p['name'], 'готово' if res['success'] else res['output'] or 'не вышло'))
+                guard(p)
+
+    text = str(data.get('announce') or '').strip()
+    if on and text:
+        res = await run_cmd('server.announce', 'в чат: ' + text_arg(text, 250, 'Объявление'), 'announce %s' % text_arg(text, 250, 'Объявление'))
+        lines.append('Объявление: ' + ('отправлено' if res['success'] else res['output'] or 'не вышло'))
+    return ok({'success': True, 'output': '\n'.join(lines)})
+
+
+async def apply_event_forces():
+    """Раз в минуту. 1) Что панель держит включённым или выключенным — сверить с ядром; у выключенного
+    главного держать выключенными и его части. 2) Событиям, которые включали или выключали вручную,
+    вернуть время по расписанию: ядро сдвинуло его до перезапуска мира. Команда на границе окна
+    расписания ставит время ровно как было — после этого следить незачем."""
+    forces, guards = event_forces(), event_guards()
+    if not forces and not guards:
+        return
+    active = await active_events()
+    pid = scan_procs().get('mangosd')
+    if active is None or not pid:
+        return
+    now = time.time()
+    evs = await event_rows()
+    for e, g in list(guards.items()):
+        if g['pid'] != pid:                                 # мир перезапускали — ядро взяло расписание из базы
+            _event_guard(e, None)
+            del guards[e]
+    for e, f in list(forces.items()):
+        if not f['until'] or f['until'] > now:
+            continue
+        _event_force_set(e, None, None)
+        del forces[e]
+        ev = evs.get(e)
+        if not ev:
+            continue
+        audit('event.keep', '«%s» (#%d): срок вышел, снова по расписанию' % (ev['name'], e))
+        if ev['ruled']:
+            _event_guard(e, pid)
+            guards[e] = {'entry': e, 'pid': pid}
+        elif f['mode'] == 'on' and e in active:             # без расписания: срок вышел — выключить
+            if (await _event_cmd(ev, False, ' — срок вышел'))['success']:
+                active.discard(e)
+
+    want = {e: (f['mode'] == 'on', _force_why(f)) for e, f in forces.items()}
+    for e, f in forces.items():
+        ev = evs.get(e)
+        for c in (ev['children'] if ev else []):
+            if c in evs and c not in forces and (f['mode'] == 'off' or evs[c]['part'] == 'before'):
+                want[c] = (False, ('пока выключено главное: «%s»' if f['mode'] == 'off' else 'пока идёт «%s» — подготовка не нужна') % ev['name'])
+    for e, (on, why) in want.items():
+        ev = evs.get(e)
+        if not ev or on == (e in active):
+            continue
+        res = await _event_cmd(ev, on, ' — ' + why)
+        if res['success']:
+            (active.add if on else active.discard)(e)
+            if ev['ruled'] and e not in guards:
+                _event_guard(e, pid)
+                guards[e] = {'entry': e, 'pid': pid}
+
+    for e in list(guards):
+        ev = evs.get(e)
+        if not ev or not ev['ruled']:
+            _event_guard(e, None)
+            continue
+        if e in want:
+            continue
+        nat = natural_on(ev, active, now)
+        # граница только что прошла — ядро могло ещё не отработать её само
+        if nat != natural_on(ev, active, now - 30) or nat == (e in active):
+            continue
+        res = await _event_cmd(ev, nat, ' — вернул время по расписанию')
+        if res['success']:
+            (active.add if nat else active.discard)(e)
+            if at_boundary(ev, nat, now):
+                _event_guard(e, None)
+
+
+async def event_loop():
+    await asyncio.sleep(40)
+    while True:
+        try:
+            await apply_event_forces()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        await asyncio.sleep(60)
+
+
+# ---- карточка существа игры: что это, в каких событиях, какие задания, где стоит
+
+NPC_ROLES = ((0x2, 'даёт задания'), (0x4, 'торговец'), (0x4000, 'чинит снаряжение'), (0x10, 'учитель'),
+             (0x8, 'распорядитель полётов'), (0x80, 'хозяин таверны'), (0x100, 'банкир'), (0x1000, 'аукционист'),
+             (0x2000, 'смотритель стойл'), (0x800, 'военачальник полей боя'), (0x200, 'регистратор гильдий'),
+             (0x400, 'гербы гильдий'), (0x20, 'целитель душ'))
+FACTION_TPL = {}
+
+
+def _faction_tpl():
+    if not FACTION_TPL:
+        try:
+            raw, count, fields, size, block = _dbc('FactionTemplate.dbc')
+            for i in range(count):
+                r = struct.unpack_from('<%dI' % fields, raw, 20 + i * size)
+                FACTION_TPL[r[0]] = r
+        except (OSError, ValueError, struct.error):
+            FACTION_TPL[0] = None
+    return FACTION_TPL
+
+
+def _reaction(r, faction, mask, friend):
+    """Как FactionTemplateEntry::IsHostileTo/IsFriendlyTo ядра относится шаблон r к игроку (его фракция, маски)."""
+    if faction in r[6:10]:
+        return 'hostile'
+    if faction in r[10:14]:
+        return 'friendly'
+    if r[5] & mask:
+        return 'hostile'
+    if r[4] & mask or r[3] & friend:
+        return 'friendly'
+    return 'neutral'
+
+
+async def faction_info(tpl):
+    r = (await asyncio.to_thread(_faction_tpl)).get(tpl)
+    if not r:
+        return {'id': tpl, 'name': '', 'alliance': None, 'horde': None}
+    factions = (await char_dbc())['factions']
+    # игрок Альянса: фракция 1 (люди), маски «игрок|Альянс», друзья — Альянс; Орды: 2 (орки), «игрок|Орда»
+    return {'id': tpl, 'name': factions.get(r[1], {}).get('name', ''),
+            'alliance': _reaction(r, 1, 3, 2), 'horde': _reaction(r, 2, 5, 4)}
+
+
+async def h_creature(request):
+    entry = int_arg(request.query.get('entry'), 1, 16777215, 'Номер существа')
+    t = await dbq(f'SELECT * FROM {W}.creature_template WHERE Entry = %s', (entry,), one=True)
+    need(t, 'Существа №%d в базе мира нет.' % entry)
+    out = {'entry': entry, 'name': t['Name'], 'subname': t['SubName'] or '', 'minlevel': t['MinLevel'], 'maxlevel': t['MaxLevel'],
+           'type': t['CreatureType'], 'rank': t['Rank'], 'unitclass': t['UnitClass'], 'civilian': bool(t['Civilian']),
+           'roles': [name for bit, name in NPC_ROLES if t['NpcFlags'] & bit],
+           'thumb': thumb_url(t['DisplayId1']) if t['DisplayId1'] else None,
+           'loot': bool(t['LootId']), 'gold_min': t['MinLootGold'], 'gold_max': t['MaxLootGold'],
+           'health_mult': t['HealthMultiplier'], 'faction': await faction_info(t['Faction']), 'health': None}
+    try:                                    # здоровье: базовое по уровню и классу × множитель существа
+        rows = await dbq(f'SELECT Level, BaseHealthExp0 AS hp FROM {W}.creature_template_classlevelstats '
+                         f'WHERE Class = %s AND Level IN (%s, %s)', (t['UnitClass'], t['MinLevel'], t['MaxLevel']))
+        hp = {r['Level']: round(r['hp'] * t['HealthMultiplier']) for r in rows}
+        if hp:
+            out['health'] = [hp.get(t['MinLevel']), hp.get(t['MaxLevel'])]
+    except Exception:  # noqa: BLE001 — в другой схеме базы таблицы может не быть
+        pass
+    spawns = await dbq(f'SELECT guid, map, position_x AS x, position_y AS y, position_z AS z FROM {W}.creature '
+                       f'WHERE id = %s LIMIT 2000', (entry,))
+    out['spawns'] = len(spawns)
+    evs = await event_rows()
+    rows = await dbq(f'SELECT ge.event, COUNT(*) AS n FROM {W}.game_event_creature ge JOIN {W}.creature c ON c.guid = ge.guid '
+                     f'WHERE c.id = %s GROUP BY ge.event', (entry,))
+    out['events'] = [{'entry': abs(r['event']), 'n': r['n'], 'off': r['event'] < 0, 'name': evs[abs(r['event'])]['name'],
+                      'icon': evs[abs(r['event'])]['icon'], 'theme': evs[abs(r['event'])]['theme']}
+                     for r in rows if abs(r['event']) in evs]
+    quests = await dbq(f'''SELECT q.entry, q.Title AS title, q.MinLevel AS min_level, (r.id IS NOT NULL) AS gives,
+                                (i.id IS NOT NULL) AS takes, gq.event
+                         FROM {W}.quest_template q
+                         LEFT JOIN {W}.creature_questrelation r ON r.quest = q.entry AND r.id = %s
+                         LEFT JOIN {W}.creature_involvedrelation i ON i.quest = q.entry AND i.id = %s
+                         LEFT JOIN {W}.game_event_quest gq ON gq.quest = q.entry
+                         WHERE r.id IS NOT NULL OR i.id IS NOT NULL ORDER BY q.MinLevel, q.Title LIMIT 200''', (entry, entry))
+    for q in quests:
+        q['gives'], q['takes'] = bool(q['gives']), bool(q['takes'])
+        q['event_name'] = evs[q['event']]['name'] if q['event'] in evs else None
+    out['quests'] = quests
+    points = [('creatures', r['map'], float(r['x']), float(r['y']), float(r['z'])) for r in spawns]
+    out['places'] = await asyncio.to_thread(event_places, points)
+    return ok(out)
+
+
 # --- фоновые задачи ----------------------------------------------------------
 
 async def cpu_loop():
@@ -4899,7 +5867,7 @@ async def on_startup(app):
     ICON_LOCK = asyncio.Lock()
     CHAR_LOCK = asyncio.Lock()
     app['tasks'] = [asyncio.create_task(cpu_loop()), asyncio.create_task(sample_loop()),
-                    asyncio.create_task(schedule_loop())]
+                    asyncio.create_task(schedule_loop()), asyncio.create_task(event_loop())]
 
 
 async def on_cleanup(app):
@@ -4954,6 +5922,11 @@ def build_app():
     r.add_post('/api/quest/save', h_quest_save)
     r.add_post('/api/quest/delete', h_quest_delete)
     r.add_post('/api/quest/apply', h_quest_apply)
+    r.add_get('/api/events', h_events)
+    r.add_get('/api/event', h_event)
+    r.add_get('/api/event/places', h_event_places)
+    r.add_get('/api/creature', h_creature)
+    r.add_post('/api/event', h_event_action)
     r.add_get('/api/bans', h_bans)
     r.add_post('/api/ban', h_ban)
     r.add_post('/api/unban', h_unban)
