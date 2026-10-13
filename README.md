@@ -16,7 +16,8 @@ server without the console and without SQL.
   there, online or offline. The ground height is taken from the server's own map files. Zoom with the mouse
   wheel towards the cursor, drag to move, pinch on a phone; zooming into a zone opens its map, zooming out
   goes back to the continent. **Top-down view** like on wow.tools — the continents built from the minimaps of
-  your game client, zoomable down to single trees.
+  your game client, zoomable down to single trees (the 1.12 minimaps are 256 px per 533 yards — there is no
+  sharper source, so the zoom stops at ×2.5 where it still looks clean).
 - **Events and holidays** — a calendar of all `game_event` events (month, year, all events as tiles):
   holidays, Darkmoon Faire, battleground weekends, invasions. Each event has its own themed card: when it runs
   next, where it takes place (zones on the world map), who appears, its quests, and its parts (for example the
@@ -374,7 +375,7 @@ py tools\build_assets.py "C:\Games\World of Warcraft"
 ```
 
 It writes `static\fonts\` (2 fonts), `static\music\` (13 tracks, ~19 MB), `static\wow\maps\` (49 maps, ~6 MB)
-and `static\wow\minimap\` (the top-down view: ~1900 tiles from the client minimaps, ~10 MB, 1–2 minutes).
+and `static\wow\minimap\` (the top-down view: ~1900 tiles from the client minimaps, ~22 MB, 1–2 minutes).
 Only some of them: `--only fonts,music`, `--only maps`, `--only minimap`.
 
 4. Copy them to the server:
@@ -590,8 +591,8 @@ text is the translation key. Dictionaries: `static/i18n/<code>.js`. Messages of 
 translated in the browser with the same dictionaries. The language follows the browser, or the choice on
 the **Settings** page.
 
-> **Note:** the newest sections — **World map, Events, Custom NPCs, Custom quests** — are not translated yet and
-> show Russian text in other languages. Contributions are welcome.
+All 9 languages are complete. Event names and descriptions sent by the server are translated in the browser
+with the same dictionaries.
 
 ```bash
 python3 tools/i18n.py check

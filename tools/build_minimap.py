@@ -11,7 +11,7 @@ in the world at X = (32 − r)·533⅓ (north edge) and Y = (32 − c)·533⅓ (
 Writes static/wow/minimap/<map>/<z>/<c>_<r>.webp — a pyramid of 256×256 tiles: z = 6 are the minimaps themselves
 (64×64 squares per continent), every level below is half the size, z = 0 is the whole continent in one tile.
 Single-colour squares (open sea, placeholders) are skipped — the page fills them with the sea colour. Next to them
-minimap.json: which tiles exist and the frame of each continent. About 1900 tiles, 10 MB, 1–2 minutes.
+minimap.json: which tiles exist and the frame of each continent. About 1900 tiles, 22 MB, 1–2 minutes.
 Needs Python 3 and Pillow (it reads BLP).
 """
 import io
@@ -30,7 +30,9 @@ OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 MAPS = {0: 'Azeroth', 1: 'Kalimdor'}
 SEA = (0, 29, 40)                       # colour of the open sea on 1.12 minimaps
 TOP = 6                                 # 2^6 = 64 squares per side
-QUALITY = 74
+QUALITY = 78
+# the minimaps themselves are already DXT1-compressed (4×4 blocks) — a second lossy pass would add its own
+QUALITY_TOP = 92
 BS = '\\'
 
 
@@ -51,9 +53,9 @@ def tile_names(wd):
     return out
 
 
-def save(img, path):
+def save(img, path, quality=QUALITY):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    img.save(path, 'WEBP', quality=QUALITY, method=5)
+    img.save(path, 'WEBP', quality=quality, method=5)
     return os.path.getsize(path)
 
 
@@ -95,7 +97,7 @@ def build(client):
             if lo == hi:                                    # single colour: sea or placeholder
                 continue
             level[c, r] = img
-            total += save(img, os.path.join(OUT, str(mapid), str(TOP), '%d_%d.webp' % (c, r)))
+            total += save(img, os.path.join(OUT, str(mapid), str(TOP), '%d_%d.webp' % (c, r)), QUALITY_TOP)
         have = {TOP: sorted(level)}
         box = frame(level)
         print('  %s: %d tiles, frame %s, %.0f s' % (folder, len(level), box, time.time() - t0))

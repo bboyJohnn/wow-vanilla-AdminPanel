@@ -59,7 +59,19 @@ function Lsrv(text) {
 }
 
 // поля ответов сервера, где приходит его собственный русский текст
-const SRV_FIELDS = new Set(['output', 'label', 'hint', 'title', 'race_name', 'class_name', 'gm_name', 'detail']);
+const SRV_FIELDS = new Set(['output', 'label', 'hint', 'title', 'race_name', 'class_name', 'gm_name', 'detail',
+  'about', 'parent_name', 'event_name']);
+/* Названия событий сервер шлёт по-русски (EVENT_META в panel.py). Поле name есть и у персонажей,
+   поэтому переводим его только в ответах про события, существа и задания */
+function trNames(v, depth = 0) {
+  if (!I18N || depth > 6 || v == null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) { v.forEach((x) => trNames(x, depth + 1)); return v; }
+  for (const k of Object.keys(v)) {
+    if (k === 'name' && typeof v[k] === 'string') v[k] = Lsrv(v[k]);
+    else if (v[k] && typeof v[k] === 'object') trNames(v[k], depth + 1);
+  }
+  return v;
+}
 function translateReply(v, depth = 0) {
   if (!I18N || depth > 8 || v == null || typeof v !== 'object') return v;
   if (Array.isArray(v)) { for (const x of v) translateReply(x, depth + 1); return v; }
@@ -4688,7 +4700,8 @@ function worldMapView(opts = {}) {
   const contAt = (f) => man.continents.find((c) => f.fx >= c.hit[0] && f.fx <= c.hit[2] && f.fy >= c.hit[1] && f.fy <= c.hit[3]);
   // приблизить можно до ×6 (карту зоны — до ×4), а над зоной уровнем ниже — пока она не встанет во весь экран
   function capAt(px, py) {
-    if (st.view === 'top') return (4 * st.aspect[0]) / tf.w;      // до ×4 к самой мини-карте
+    // мини-карта игры — 256 точек на 533 ярда, подробнее данных нет: дальше ×2,5 видны только квадраты сжатия
+    if (st.view === 'top') return (2.5 * st.aspect[0]) / tf.w;
     const hit = st.view === 'world' ? null : kidAt(fracAt(px, py));
     return Math.max(st.view === 'world' ? 2.5 : st.view === 'zone' ? 4 : 6, hit ? 1.15 / (hit.r[2] - hit.r[0]) : 0);
   }
@@ -4732,6 +4745,8 @@ function worldMapView(opts = {}) {
   }
 
   const hint = (text) => fill(info, h('p', { class: 'muted small' }, text));
+  // выбранная точка на той же карте (материке), что открыта сейчас
+  const hasPoint = () => !!(st.point && bounds() && st.point.map === mapId());
   const bounds = () => (st.view === 'zone' ? st.zone.bounds : st.view === 'cont' ? st.cont.bounds : st.view === 'top' ? st.top.bounds : null);
   const mapId = () => (st.view === 'zone' ? st.zone.map : st.view === 'cont' ? st.cont.map : st.view === 'top' ? st.top.map : null);
   // мировая точка под (px, py) и сколько ярдов в точке экрана — чтобы другой вид открылся на том же месте
@@ -4867,6 +4882,11 @@ function worldMapView(opts = {}) {
     if (mapId() != null) {
       try { drawPins(await loadPins(mapId())); } catch (e) { toast(e.message, true); }
     }
+    // выбранная точка остаётся на любой карте, где она видна: сменили вид или уровень — метка и карточка на месте
+    if (hasPoint()) {
+      const f = toFrac(bounds(), st.point.x, st.point.y);
+      if (inFrac(f)) { mark = h('i', { class: 'wm-mark' }); layer.append(placeAt(mark, f.fx, f.fy)); }
+    }
   }
 
   function hitBox(r, label, onclick) {
@@ -4895,7 +4915,7 @@ function worldMapView(opts = {}) {
     const pins = [...layer.children];
     for (const z of zones) layer.append(hitBox(rectIn(c.bounds, z.bounds), mapTitle(z), () => showZone(z)));
     layer.append(...pins);
-    hint(L('Выберите зону: щёлкните по ней или приблизьте колёсиком — её карта откроется сама.'));
+    if (!hasPoint()) hint(L('Выберите зону: щёлкните по ней или приблизьте колёсиком — её карта откроется сама.'));
   }
 
   async function showZone(z, point, t) {
@@ -4909,7 +4929,7 @@ function worldMapView(opts = {}) {
     setLevel(t);
     await render(z.file);
     if (point) pick(point.x, point.y, point.z);
-    else hint(opts.note || L('Щёлкните по месту на карте — панель найдёт высоту земли в этой точке.'));
+    else if (!hasPoint()) hint(opts.note || L('Щёлкните по месту на карте — панель найдёт высоту земли в этой точке.'));
   }
 
   async function showTop(c, at) {
@@ -4917,7 +4937,7 @@ function worldMapView(opts = {}) {
     Object.assign(st, { view: 'top', cont: c, zone: null, top, aspect: top.aspect });
     setLevel(at);
     await render(null);
-    hint(opts.note || L('Вид сверху — мини-карты игры. Колёсиком можно приблизить до отдельных деревьев; щёлкните по месту — панель найдёт высоту земли.'));
+    if (!hasPoint()) hint(opts.note || L('Вид сверху — мини-карты игры. Колёсиком можно приблизить до отдельных деревьев; щёлкните по месту — панель найдёт высоту земли.'));
   }
 
   async function pick(x, y, zManual) {
@@ -6398,7 +6418,7 @@ function eventDrawer(entry, onChange, back) {
   const changed = () => { draw(); if (onChange) onChange(); };
   const draw = async () => {
     let e;
-    try { e = (await api('/api/event?entry=' + entry)).data; } catch (err) {
+    try { e = trNames((await api('/api/event?entry=' + entry)).data); } catch (err) {
       fill(box, drawerBox(L('Событие №{0}', entry), null, close, back), h('div', { class: 'drawer-b' }, errorCard(err)));
       return;
     }
@@ -6501,7 +6521,7 @@ function questDrawer(entry, back) {
   (async () => {
     let d;
     try {
-      [d] = await Promise.all([api('/api/quest?entry=' + entry).then((r) => r.data),
+      [d] = await Promise.all([api('/api/quest?entry=' + entry).then((r) => trNames(r.data)),
         questMeta ? null : api('/api/quest/meta').then((r) => { questMeta = r.data; }).catch(() => null)]);
     } catch (err) {
       fill(box, drawerBox(L('Задание №{0}', entry), null, close, back), h('div', { class: 'drawer-b' }, errorCard(err)));
@@ -6580,7 +6600,7 @@ function creatureDrawer(entry, back) {
   const close = openOverlay(box, back ? back.refresh : null);
   (async () => {
     let c;
-    try { c = (await api('/api/creature?entry=' + entry)).data; } catch (err) {
+    try { c = trNames((await api('/api/creature?entry=' + entry)).data); } catch (err) {
       fill(box, drawerBox(L('Существо №{0}', entry), null, close, back), h('div', { class: 'drawer-b' }, errorCard(err)));
       return;
     }
@@ -6639,7 +6659,7 @@ PAGES.events = {
     const box = h('div', { class: 'stack' });
     const open = (entry) => eventDrawer(entry, () => load().catch(() => {}));
     const load = async () => {
-      st.data = (await api('/api/events?year=' + st.year)).data;
+      st.data = trNames((await api('/api/events?year=' + st.year)).data);
       draw();
     };
     // со «включить» у события с конфликтами — сразу в карточку: там видно, с чем оно спорит
@@ -6647,7 +6667,7 @@ PAGES.events = {
       if (on && e.conflicts.length) { open(e.entry); return; }
       let full = e;
       if (e.children.length) {
-        try { full = (await api('/api/event?entry=' + e.entry)).data; } catch (err) { toast(err.message, true); return; }
+        try { full = trNames((await api('/api/event?entry=' + e.entry)).data); } catch (err) { toast(err.message, true); return; }
       }
       evQuickModal(full, on, () => load().catch(() => {}));
     };

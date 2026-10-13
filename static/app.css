@@ -931,7 +931,7 @@ html:root[data-style="wow"] { font-synthesis: none; }
 .wm-img.loading { opacity: 0; }
 .wm-img[hidden] { display: none; }
 .wm-view.top { aspect-ratio: auto; height: min(72vh, 780px); max-height: none; background: #001d28; }
-.wm-tiles { position: absolute; inset: 0; pointer-events: none; }
+.wm-tiles { position: absolute; inset: 0; z-index: 0; pointer-events: none; }   /* свой слой: плитки не перекрывают метки */
 .wm-tile { position: absolute; display: block; max-width: none; opacity: 0; transition: opacity .2s; user-select: none; -webkit-user-drag: none; }
 .wm-tile.on { opacity: 1; }
 .wm-mode .seg button { height: 34px; }
